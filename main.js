@@ -17,19 +17,20 @@
 
 /* ---------------- 全局配置 ---------------- */
 const CFG = {
-  COLS: 28,
-  ROWS: 18,
+  COLS: 40,
+  ROWS: 20,
 
   // 主站（左下）与卸货区（右上），单位：格，含端点
-  HOME: { x0: 1, y0: 13, x1: 4, y1: 16 },
-  DROP: { x0: 23, y0: 1, x1: 26, y1: 4 },
+  HOME: { x0: 1, y0: 14, x1: 5, y1: 18 },
+  DROP: { x0: 34, y0: 1, x1: 38, y1: 5 },
 
-  // 货架排：横向长条、2 格厚，每 2 格为一个货位（共 3 排 × 6 货位）
-  // 布局对称：主站 x1-4 | 通道 x5-7 | 货架 x8-19 | 通道 x20-22 | 卸货区 x23-26
+  // 货架排：横向长条、2 格厚，每 2 格为一个货位（共 3 排 × 10 货位）
+  // 布局对称：边1 | 主站5 | 通道4 | 货架20 | 通道4 | 卸货5 | 边1 = 40 列
+  // 纵向：边1 | 顶通道3 | A2 | 通道3 | B2 | 通道3 | C2 | 底通道3 | 边1 = 20 行
   SHELVES: [
-    { row: 'A', x0: 8, y0: 3, x1: 19, y1: 4 },
-    { row: 'B', x0: 8, y0: 8, x1: 19, y1: 9 },
-    { row: 'C', x0: 8, y0: 13, x1: 19, y1: 14 },
+    { row: 'A', x0: 10, y0: 4, x1: 29, y1: 5 },
+    { row: 'B', x0: 10, y0: 9, x1: 29, y1: 10 },
+    { row: 'C', x0: 10, y0: 14, x1: 29, y1: 15 },
   ],
 
   // 货物包装色板（中饱和、彼此和谐）；货物位于随机货架格
@@ -609,9 +610,9 @@ class Simulation {
     this.effects = new Effects();   // 粒子 / 波纹（跟随仿真时间，暂停时冻结）
 
     // 三个机器人，主站停车位出发
-    this.addRobot(2, 13);
-    this.addRobot(3, 13);
-    this.addRobot(4, 13);
+    this.addRobot(2, 14);
+    this.addRobot(3, 14);
+    this.addRobot(4, 14);
     this.spawnRandomCargos();
   }
 
@@ -660,9 +661,9 @@ class Simulation {
   reset() {
     this.grid.rebuild();
     this.robots = [];
-    this.addRobot(2, 13);
-    this.addRobot(3, 13);
-    this.addRobot(4, 13);
+    this.addRobot(2, 14);
+    this.addRobot(3, 14);
+    this.addRobot(4, 14);
     this.delivered = 0;
     this.elapsed = 0;
     this.collisions = 0;
@@ -674,9 +675,13 @@ class Simulation {
   /** 增加机器人：优先主站停车位 → 主站任意空闲格；上限 8 */
   addRobotAuto() {
     if (this.robots.length >= CFG.MAX_ROBOTS) return null;
-    const occupied = new Set(this.robots.map(r => `${r.gx},${r.gy}`));
+    // 排除所有机器人占用的格（移动中占 from + to 两格，否则新机器人会出生在别人驶入的格上）
+    const occupied = new Set();
+    for (const r of this.robots) {
+      for (const [x, y] of r.occupiedCells()) occupied.add(`${x},${y}`);
+    }
     const candidates = [];
-    for (let i = 0; i < 3; i++) candidates.push([CFG.HOME.x0 + 1 + i, CFG.HOME.y0]);   // 停车位
+    for (let i = 0; i < 4; i++) candidates.push([CFG.HOME.x0 + 1 + i, CFG.HOME.y0]);   // 停车位
     for (let y = CFG.HOME.y1; y >= CFG.HOME.y0; y--)                                   // 主站其余格
       for (let x = CFG.HOME.x0; x <= CFG.HOME.x1; x++) candidates.push([x, y]);
     for (const [x, y] of candidates) {
@@ -1080,12 +1085,12 @@ class Renderer {
     c.font = `800 ${Math.round(this.cs * 1.05)}px system-ui, sans-serif`;
     for (const s of CFG.SHELVES) {
       const cy = this.py((s.y0 + s.y1 + 1) / 2);
-      c.fillText(s.row, this.px(6.5), cy);
-      c.fillText(s.row, this.px(21.5), cy);
+      c.fillText(s.row, this.px(8.0), cy);
+      c.fillText(s.row, this.px(32.0), cy);
     }
   }
 
-  /** 通道内指向卸货区的地面箭头（x=20~22 通道，y=3 行中央，正对装卸口） */
+  /** 通道内指向卸货区的地面箭头（x=30~33 通道，y=3 行中央，正对装卸口） */
   drawDropChevrons(c) {
     const cy = this.py(3.0);
     c.strokeStyle = 'rgba(74,222,128,0.5)';
@@ -1093,7 +1098,7 @@ class Renderer {
     c.lineCap = 'round';
     c.lineJoin = 'round';
     for (let k = 0; k < 3; k++) {
-      const cx = this.px(20.6 + k * 0.6);
+      const cx = this.px(30.6 + k * 0.6);
       chevronPath(c, cx, cy, this.cs * 0.36, this.cs * 0.44);
       c.stroke();
     }
@@ -1214,7 +1219,7 @@ class Renderer {
     c.setLineDash([5, 4]);
     c.strokeStyle = 'rgba(59,130,246,0.42)';
     c.lineWidth = 1.2;
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       const sx = this.px(z.x0 + 1 + i) + 5, sy = this.py(z.y0) + 5;
       rr(c, sx, sy, cs - 10, cs - 10, 6);
       c.stroke();
@@ -1253,7 +1258,7 @@ class Renderer {
     c.stroke();
     c.restore();
 
-    for (const ry of [z.y0 + 1, z.y0 + 2]) {
+    for (const ry of [z.y0 + 1, z.y0 + 3]) {
       const dx = this.px(z.x0) + cs * 0.08;
       const dy = this.py(ry) + cs * 0.17;
       const dw = cs * 0.3, dh = cs * 0.66;

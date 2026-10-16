@@ -28,7 +28,7 @@ CLAUDE.md    本文件
 ## 核心模块约定（main.js 内）
 
 - `CFG`：全局配置（网格尺寸、布局、配色、速度）。
-- `Grid`：28×18 网格数据，格子类型 floor/shelf/home/drop/obstacle；可通行判定。
+- `Grid`：40×20 网格数据，格子类型 floor/shelf/home/drop/obstacle；可通行判定。
 - `PathPlanner`：A*（四方向、曼哈顿启发、**二叉堆**开放列表）；接受「临时占用格」
   参数；含节流。
 - `Cargo`：货物（id、格坐标、包装色、assignedTo）。货物位于**货架格**上；
