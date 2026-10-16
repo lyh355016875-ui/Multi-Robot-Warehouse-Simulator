@@ -90,6 +90,13 @@ function wrapAngle(a) {
   return a;
 }
 
+/** 回弹缓动（障碍弹入动画用） */
+function easeOutBack(t) {
+  const c = 1.70158;
+  t -= 1;
+  return 1 + (c + 1) * t * t * t + c * t * t;
+}
+
 /** 颜色调节：k>0 变亮、k<0 变暗，返回 rgb() 字符串 */
 function shade(hex, k) {
   const n = parseInt(hex.slice(1), 16);
@@ -149,6 +156,8 @@ class Grid {
   /** 根据布局配置重建格子类型 */
   rebuild() {
     this.cells = Array.from({ length: CFG.ROWS }, () => new Array(CFG.COLS).fill(CELL.FLOOR));
+    // 动态障碍：key "x,y" → {x, y, born}（born 为放置时刻的仿真毫秒，弹入动画用）
+    this.obstacles = new Map();
     const mark = (zone, type) => {
       for (let y = zone.y0; y <= zone.y1; y++)
         for (let x = zone.x0; x <= zone.x1; x++)
@@ -315,6 +324,8 @@ class Robot {
     this.color = CFG.ROBOT_COLORS[id % CFG.ROBOT_COLORS.length];
     this.blockedMs = 0;                // 连续受阻时长（仿真毫秒，死锁解除用）
     this.replanCooldown = 0;           // 规划失败冷却（防止高频重试 A*）
+    this.needReplan = false;           // 障碍阻断路径，待本步完成后重规划
+    this.replanFlashUntil = 0;         // REPLANNING 闪烁提示截止时刻（仿真毫秒）
   }
 
   /** 渲染插值位置（浮点格坐标） */
@@ -363,12 +374,27 @@ class Robot {
 
   updateDecision(dt, sim) {
     if (this.replanCooldown > 0) this.replanCooldown -= dt;
+    // REPLANNING 闪烁期结束 → 恢复任务显示状态
+    if (this.state === RS.REPLANNING && sim.elapsed > this.replanFlashUntil) {
+      this.state = this.taskState;
+    }
     if (this.moving) { this.blockedMs = 0; return; }
+
+    // 障碍阻断路径（移动中标记的）：本步走完后立即重规划
+    if (this.needReplan) {
+      this.needReplan = false;
+      this.replanNow(sim);
+    }
 
     if (this.path.length === 0) this.onArrive(sim);
     if (this.path.length === 0) return;
 
     const next = this.path[0];
+    // 兜底：路径含障碍格（正常应已被 onObstaclesChanged 处理）
+    if (!sim.grid.walkable(next.x, next.y)) {
+      this.replanNow(sim);
+      return;
+    }
     const occ = sim.occupiedBy(next.x, next.y, this);
     if (!occ) {
       // 格子空闲：进入（消耗上一格的溢出时间，速度连续）
@@ -407,6 +433,23 @@ class Robot {
   /** 空闲：认领最近未分配货物（按拣货位距离），规划到拣货位 */
   onIdle(sim) {
     if (this.replanCooldown > 0) return;
+
+    // 当前格被用户放置障碍（宽限机制）：先挪到最近空闲格，"下一步必须离开"
+    if (!sim.grid.walkable(this.gx, this.gy)) {
+      const goal = sim.findFreeCellNear(this.gx, this.gy, this);
+      if (goal) {
+        const p = sim.planner.findPath({ x: this.gx, y: this.gy }, goal, sim.blockedFor(this));
+        if (p && p.length) {
+          this.path = p;
+          this.state = RS.REPLANNING;
+          this.replanFlashUntil = sim.elapsed + 900;
+          return;
+        }
+      }
+      this.replanCooldown = 400;
+      return;
+    }
+
     let best = null, bCell = null, bd = Infinity;
     for (const c of sim.cargos) {
       if (c.assignedTo !== null || c.collected) continue;
@@ -450,18 +493,41 @@ class Robot {
     }
   }
 
+  /** 立即重规划（障碍阻断触发）：跳过冷却，闪烁提示 900ms */
+  replanNow(sim) {
+    this.replanCooldown = 0;
+    this.state = RS.REPLANNING;
+    this.replanFlashUntil = sim.elapsed + 900;
+    if (this.taskState === RS.TO_PICKUP) this.planPickup(sim);
+    else if (this.taskState === RS.CARRYING) this.planDrop(sim);
+    else this.onIdle(sim);
+  }
+
   planPickup(sim) {
     if (this.replanCooldown > 0) return;
     const c = this.cargo;
     if (!c || c.collected) { this.abandonTask(); return; }
     const cell = sim.bestPickupCell(c, this.gx, this.gy, this);
     if (!cell || (cell.x === this.gx && cell.y === this.gy)) {
-      this.replanCooldown = 300;
+      // 无可用拣货位：区分"暂时被机器人占"与"被障碍围死"
+      const anyNbr = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+        .map(([dx, dy]) => ({ x: c.x + dx, y: c.y + dy }))
+        .find(p => sim.grid.walkable(p.x, p.y));
+      if (!anyNbr || !sim.planner.findPath({ x: this.gx, y: this.gy }, anyNbr, null)) {
+        this.abandonTask();               // 货物被障碍围死，放弃转投其他任务
+      } else {
+        this.replanCooldown = 300;        // 暂时被占，稍后重试
+      }
       return;
     }
     const p = sim.planner.findPath({ x: this.gx, y: this.gy }, cell, sim.blockedFor(this));
-    if (p && p.length) this.path = p;
-    else this.replanCooldown = 300;
+    if (p && p.length) { this.path = p; return; }
+    // 规划失败：路线被机器人挡（暂时）或被障碍堵死（永久）
+    if (!sim.planner.findPath({ x: this.gx, y: this.gy }, cell, null)) {
+      this.abandonTask();
+    } else {
+      this.replanCooldown = 300;
+    }
   }
 
   planDrop(sim) {
@@ -510,6 +576,76 @@ class Simulation {
     const r = new Robot(this.robots.length, x, y);
     this.robots.push(r);
     return r;
+  }
+
+  /* ---- 动态障碍 ---- */
+
+  /** 可否在 (x,y) 放置障碍：仅通道地板；移动中机器人的 from/to 格禁放
+   *  （刹不住），静止机器人的当前格允许（宽限机制：下一步必须离开） */
+  canPlaceObstacle(x, y) {
+    if (this.grid.at(x, y) !== CELL.FLOOR) return false;
+    for (const r of this.robots) {
+      if (r.moving && ((r.gx === x && r.gy === y) || (r.toX === x && r.toY === y))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  placeObstacle(x, y) {
+    if (!this.canPlaceObstacle(x, y)) return false;
+    this.grid.cells[y][x] = CELL.OBST;
+    this.grid.obstacles.set(`${x},${y}`, { x, y, born: this.elapsed });
+    this.onObstaclesChanged();
+    return true;
+  }
+
+  removeObstacle(x, y) {
+    if (this.grid.at(x, y) !== CELL.OBST) return false;
+    this.grid.cells[y][x] = CELL.FLOOR;
+    this.grid.obstacles.delete(`${x},${y}`);
+    this.onObstaclesChanged();
+    return true;
+  }
+
+  /** 障碍变更：所有机器人立即检测路径阻断并重规划；等待者解除冷却重试 */
+  onObstaclesChanged() {
+    for (const r of this.robots) {
+      r.replanCooldown = 0;
+      r.blockedMs = 0;
+      let broken = false;
+      for (const cell of r.path) {
+        if (!this.grid.walkable(cell.x, cell.y)) { broken = true; break; }
+      }
+      if (broken) {
+        if (r.moving) r.needReplan = true;   // 本步走完后重规划（to 格禁放障碍，安全）
+        else r.replanNow(this);
+      } else if (r.path.length === 0 && r.taskState !== RS.IDLE) {
+        r.replanNow(this);                   // 等待重试的任务机器人：立即重试
+      }
+    }
+  }
+
+  /** BFS 搜索距 (x,y) 最近的空闲可通行格（可穿越障碍扩展） */
+  findFreeCellNear(x, y, robot) {
+    const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const q = [[x, y]];
+    const seen = new Set([`${x},${y}`]);
+    while (q.length > 0) {
+      const [cx, cy] = q.shift();
+      for (const [dx, dy] of DIRS) {
+        const nx = cx + dx, ny = cy + dy;
+        const k = `${nx},${ny}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        if (!this.grid.inBounds(nx, ny)) continue;
+        if (this.grid.walkable(nx, ny) && !this.occupiedBy(nx, ny, robot)) {
+          return { x: nx, y: ny };
+        }
+        q.push([nx, ny]);
+      }
+    }
+    return null;
   }
 
   /* ---- 占用与通行 ---- */
@@ -648,6 +784,8 @@ class Renderer {
     this.ox = 0; this.oy = 0;
     this.gw = 0; this.gh = 0;
     this.staticLayer = document.createElement('canvas');
+    this.hoverCell = null;    // 鼠标悬停格（提示用）
+    this.painting = null;     // 按住拖动模式：'add' | 'remove'
   }
 
   /** 容器 / DPR 变化时重算尺寸并重建静态层 */
@@ -676,6 +814,41 @@ class Renderer {
   /** 浮点格坐标 → 像素中心 */
   cx(x) { return this.ox + x * this.cs + this.cs / 2; }
   cy(y) { return this.oy + y * this.cs + this.cs / 2; }
+
+  /* ============================================================
+   * 鼠标交互：左键放置 / 右键移除障碍，按住可拖动连续绘制
+   * ============================================================ */
+  cellFromEvent(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left - this.ox;
+    const y = e.clientY - rect.top - this.oy;
+    if (x < 0 || y < 0 || x >= this.gw || y >= this.gh) return null;
+    return { x: Math.floor(x / this.cs), y: Math.floor(y / this.cs) };
+  }
+
+  bindInput() {
+    const cv = this.canvas;
+    cv.addEventListener('contextmenu', e => e.preventDefault());
+    cv.addEventListener('mousedown', e => {
+      const cell = this.cellFromEvent(e);
+      if (!cell) return;
+      if (e.button === 0) {
+        this.painting = 'add';
+        this.sim.placeObstacle(cell.x, cell.y);
+      } else if (e.button === 2) {
+        this.painting = 'remove';
+        this.sim.removeObstacle(cell.x, cell.y);
+      }
+    });
+    cv.addEventListener('mousemove', e => {
+      this.hoverCell = this.cellFromEvent(e);
+      if (!this.hoverCell || !this.painting) return;
+      if (this.painting === 'add') this.sim.placeObstacle(this.hoverCell.x, this.hoverCell.y);
+      else this.sim.removeObstacle(this.hoverCell.x, this.hoverCell.y);
+    });
+    window.addEventListener('mouseup', () => { this.painting = null; });
+    cv.addEventListener('mouseleave', () => { this.hoverCell = null; });
+  }
 
   /* ============================================================
    * 静态层：一次性绘制，resize 时重建
@@ -997,9 +1170,11 @@ class Renderer {
     c.clearRect(0, 0, this.cssW, this.cssH);
     c.drawImage(this.staticLayer, 0, 0, this.cssW, this.cssH);
     this.drawAmbientFx(c, t);
-    this.drawPaths(c);
+    this.drawObstacles(c);
+    this.drawPaths(c, t);
     this.drawCargos(c);
     this.drawRobots(c);
+    this.drawHover(c);
   }
 
   /** 环境动效：卸货区脉冲光圈 + 主站呼吸光晕 */
@@ -1027,15 +1202,93 @@ class Renderer {
     zoneRing(CFG.HOME, 4 + 3 * p2, 'rgba(59,130,246,0.9)', 0.07 + 0.11 * p2, 14);
   }
 
-  /** 路径：机器人色 30% 透明度虚线折线，随速度流动 */
-  drawPaths(c) {
+  /** 障碍物：俯视警示桶（橙白扇形条纹），260ms 弹入动画 */
+  drawObstacles(c) {
+    for (const ob of this.grid.obstacles.values()) {
+      const cx = this.cx(ob.x), cy = this.cy(ob.y);
+      const cs = this.cs;
+      const age = this.sim.elapsed - ob.born;
+      const k = age >= 260 ? 1 : Math.max(0.01, easeOutBack(clamp(age / 260, 0, 1)));
+
+      c.save();
+      c.translate(cx, cy);
+      c.scale(k, k);
+
+      // 阴影
+      c.fillStyle = 'rgba(0,0,0,0.4)';
+      c.beginPath();
+      c.ellipse(1.5, cs * 0.13, cs * 0.33, cs * 0.25, 0, 0, Math.PI * 2);
+      c.fill();
+
+      const R = cs * 0.36;
+      // 桶身深色外圈
+      c.beginPath();
+      c.arc(0, 0, R, 0, Math.PI * 2);
+      c.fillStyle = '#9A3412';
+      c.fill();
+      // 橙白警示扇形（桶盖）
+      for (let i = 0; i < 8; i++) {
+        const a0 = i * Math.PI / 4 - Math.PI / 8, a1 = a0 + Math.PI / 4;
+        c.beginPath();
+        c.moveTo(0, 0);
+        c.arc(0, 0, R - 1.5, a0, a1);
+        c.closePath();
+        c.fillStyle = i % 2 === 0 ? '#F97316' : '#F8FAFC';
+        c.fill();
+      }
+      // 中心深色圆点
+      c.beginPath();
+      c.arc(0, 0, R * 0.22, 0, Math.PI * 2);
+      c.fillStyle = '#7C2D12';
+      c.fill();
+      // 高光弧
+      c.strokeStyle = 'rgba(255,255,255,0.45)';
+      c.lineWidth = 1.5;
+      c.beginPath();
+      c.arc(0, 0, R - 2, -Math.PI * 0.9, -Math.PI * 0.45);
+      c.stroke();
+      c.restore();
+    }
+  }
+
+  /** 悬停指示：可放置格淡橙虚线框；障碍格红框（提示右键移除） */
+  drawHover(c) {
+    const h = this.hoverCell;
+    if (!h || this.painting) return;
+    const x = this.px(h.x), y = this.py(h.y);
+    const s = this.cs;
+    if (this.grid.at(h.x, h.y) === CELL.OBST) {
+      c.strokeStyle = 'rgba(248,113,113,0.75)';
+      c.lineWidth = 2;
+      rr(c, x + 2, y + 2, s - 4, s - 4, 6);
+      c.stroke();
+    } else if (this.sim.canPlaceObstacle(h.x, h.y)) {
+      c.fillStyle = 'rgba(249,115,22,0.13)';
+      rr(c, x + 2, y + 2, s - 4, s - 4, 6);
+      c.fill();
+      c.setLineDash([4, 3]);
+      c.strokeStyle = 'rgba(249,115,22,0.55)';
+      c.lineWidth = 1.5;
+      rr(c, x + 2, y + 2, s - 4, s - 4, 6);
+      c.stroke();
+      c.setLineDash([]);
+    }
+  }
+
+  /** 路径：机器人色 30% 透明度虚线折线，随速度流动；重规划时高频闪烁 */
+  drawPaths(c, t) {
     for (const r of this.sim.robots) {
       if (!r.moving && r.path.length === 0) continue;
       const p0 = r.renderPos();
       const pts = [p0, ...r.path];
 
+      let alpha = 0.30;
+      if (r.state === RS.REPLANNING) {
+        alpha = 0.30 * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t / 55)));
+      }
+
       c.save();
-      c.strokeStyle = withA(r.color, 0.30);
+      c.strokeStyle = withA(r.color, alpha);
       c.lineWidth = 2;
       c.setLineDash([7, 6]);
       c.lineCap = 'round';
@@ -1207,9 +1460,10 @@ class Renderer {
     }
     c.restore();
 
-    // 状态灯（不随角度旋转，位于中心）：空闲绿 / 移动蓝 / 等待黄 / 载货橙
+    // 状态灯（不随角度旋转，位于中心）：空闲绿 / 移动蓝 / 等待黄 / 载货橙 / 重规划青
     const lamp = r.state === RS.IDLE ? '#4ADE80'
       : r.state === RS.WAITING ? '#FACC15'
+      : r.state === RS.REPLANNING ? '#22D3EE'
       : r.state === RS.CARRYING ? '#FB923C'
       : '#38BDF8';
     c.save();
@@ -1239,6 +1493,7 @@ class Renderer {
 
   window.__sim = sim;           // 调试 / 自测钩子
   window.__renderer = renderer;
+  renderer.bindInput();
 
   const onResize = () => renderer.resize();
   window.addEventListener('resize', onResize);

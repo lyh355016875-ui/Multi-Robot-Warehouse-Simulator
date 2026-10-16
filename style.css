@@ -122,6 +122,7 @@ body::before {
   height: 100%;
   display: block;
   border-radius: var(--radius);
+  cursor: crosshair;
 }
 
 /* ---------------- 左侧状态面板 ---------------- */
