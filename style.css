@@ -346,11 +346,24 @@ input[type="range"]:disabled { cursor: not-allowed; opacity: 0.35; }
   font-weight: 600;
 }
 
-/* ---------------- 响应式（完整优化在 v0.7） ---------------- */
+/* ---------------- 响应式 ---------------- */
 @media (max-width: 780px) {
   #hud { transform: scale(0.88); transform-origin: top left; }
   .brand h1 { font-size: 15px; }
   .subtitle { display: none; }
   .btn { padding: 7px 13px; font-size: 12px; }
   input[type="range"] { width: 110px; }
+}
+
+/* 窄窗口：面板进一步精简，避免遮挡画面 */
+@media (max-width: 620px) {
+  #hud { transform: scale(0.8); transform-origin: top left; }
+  #hud .legend, #hud .hint { display: none; }
+  .brand h1 { font-size: 14px; }
+  .btn { padding: 6px 10px; font-size: 12px; }
+}
+
+/* 矮窗口：隐藏次要信息，保住画布高度 */
+@media (max-height: 560px) {
+  #hud .legend, #hud .hint { display: none; }
 }

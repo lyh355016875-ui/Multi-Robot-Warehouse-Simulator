@@ -922,7 +922,7 @@ class Renderer {
     this.canvas.width = Math.round(cssW * dpr);
     this.canvas.height = Math.round(cssH * dpr);
 
-    this.cs = clamp(Math.floor(Math.min((cssW - 24) / CFG.COLS, (cssH - 24) / CFG.ROWS)), 14, 48);
+    this.cs = clamp(Math.floor(Math.min((cssW - 24) / CFG.COLS, (cssH - 24) / CFG.ROWS)), 10, 48);
     this.gw = this.cs * CFG.COLS;
     this.gh = this.cs * CFG.ROWS;
     this.ox = Math.round((cssW - this.gw) / 2);
@@ -1815,10 +1815,15 @@ class UI {
   window.__ui = ui;
   renderer.bindInput();
 
-  const onResize = () => renderer.resize();
-  window.addEventListener('resize', onResize);
+  // 静态层重建约 46ms，窗口拖动时连续触发会卡顿 → 防抖 120ms（停手后一次性重建）
+  let resizeTimer = null;
+  const debouncedResize = () => {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => { resizeTimer = null; renderer.resize(); }, 120);
+  };
+  window.addEventListener('resize', debouncedResize);
   if (typeof ResizeObserver !== 'undefined') {
-    new ResizeObserver(onResize).observe(canvas.parentElement);
+    new ResizeObserver(debouncedResize).observe(canvas.parentElement);
   }
   renderer.resize();
 
