@@ -14,3 +14,6 @@ ehthumbs.db
 *.log
 tmp/
 node_modules/
+
+# 同目录下无关的独立项目（不属于本仓库）
+/Robot-Arm-Simulator/

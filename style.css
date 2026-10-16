@@ -1,0 +1,241 @@
+/* ============================================================
+ * 多机器人智能仓库仿真 · style.css
+ * 深色科技仓库主题：毛玻璃面板 / 圆角 / 柔和阴影 / 克制的霓虹
+ * ============================================================ */
+
+:root {
+  --bg: #0B1220;
+  --panel: rgba(13, 20, 36, 0.72);
+  --stroke: rgba(148, 163, 184, 0.14);
+  --stroke-strong: rgba(148, 163, 184, 0.32);
+  --text: #E2E8F0;
+  --dim: #94A3B8;
+  --blue: #3B82F6;
+  --green: #22C55E;
+  --orange: #F97316;
+  --radius: 14px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 环境光：左下微蓝（主站）、右上微绿（卸货区），呼应画布布局 */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(1000px 620px at -8% 112%, rgba(59, 130, 246, 0.07), transparent 62%),
+    radial-gradient(920px 540px at 108% -12%, rgba(34, 197, 94, 0.06), transparent 62%);
+}
+
+#app {
+  position: relative;
+  z-index: 1;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+/* ---------------- 毛玻璃基础 ---------------- */
+.glass {
+  background: var(--panel);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.38);
+}
+
+/* ---------------- 顶部标题栏 ---------------- */
+#topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 18px;
+  flex: none;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+.logo { filter: drop-shadow(0 2px 8px rgba(59, 130, 246, 0.45)); flex: none; }
+.brand-text { display: flex; flex-direction: column; gap: 1px; }
+.brand h1 { font-size: 17px; font-weight: 650; letter-spacing: 0.5px; }
+.subtitle {
+  font-size: 10px;
+  color: var(--dim);
+  letter-spacing: 2.4px;
+  text-transform: uppercase;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: rgba(59, 130, 246, 0.10);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  color: #93C5FD;
+  letter-spacing: 0.5px;
+}
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #38BDF8;
+  box-shadow: 0 0 8px #38BDF8;
+  animation: pulse 2.4s ease-in-out infinite;
+}
+@keyframes pulse { 50% { opacity: 0.35; } }
+
+/* ---------------- 舞台与画布 ---------------- */
+#stage { position: relative; flex: 1; min-height: 0; }
+
+#cv {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: var(--radius);
+}
+
+/* ---------------- 左侧状态面板 ---------------- */
+#hud {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  width: 188px;
+  padding: 14px 16px 12px;
+}
+#hud h2 {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--dim);
+  letter-spacing: 2.5px;
+  margin-bottom: 8px;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 5px 0;
+  font-size: 13px;
+}
+.stat-label { color: var(--dim); }
+.stat-value {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  font-size: 15px;
+}
+.divider { height: 1px; background: var(--stroke); margin: 9px 0; }
+
+.legend { display: flex; flex-direction: column; gap: 2px; }
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12px;
+  color: var(--dim);
+  padding: 3px 0;
+}
+.dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.dot.home { background: var(--blue); box-shadow: 0 0 7px rgba(59, 130, 246, 0.9); }
+.dot.drop { background: var(--green); box-shadow: 0 0 7px rgba(34, 197, 94, 0.9); }
+.dot.shelf { background: #475569; }
+
+.hint {
+  margin-top: 10px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--dim);
+  opacity: 0.85;
+}
+
+/* ---------------- 底部控制栏 ---------------- */
+#controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  flex: none;
+  flex-wrap: wrap;
+}
+.ctrl-group { display: flex; align-items: center; gap: 8px; }
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--stroke);
+  background: rgba(30, 41, 59, 0.55);
+  color: var(--text);
+  padding: 8px 17px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-family: inherit;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease, box-shadow 0.16s ease;
+}
+.btn:hover:not(:disabled) {
+  background: rgba(51, 65, 85, 0.85);
+  border-color: var(--stroke-strong);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+}
+.btn:active:not(:disabled) { transform: translateY(0); box-shadow: none; }
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.btn.primary {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.45);
+  color: #BFDBFE;
+}
+.btn.primary:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.32);
+  border-color: rgba(59, 130, 246, 0.65);
+}
+/* 禁用时的主按钮回归中性外观，避免"看似激活"的歧义 */
+.btn.primary:disabled {
+  background: rgba(30, 41, 59, 0.55);
+  border-color: var(--stroke);
+  color: var(--text);
+}
+
+.speed-group { gap: 10px; font-size: 13px; color: var(--dim); }
+.speed-group label { letter-spacing: 1px; }
+input[type="range"] {
+  width: 150px;
+  accent-color: var(--blue);
+  cursor: pointer;
+}
+input[type="range"]:disabled { cursor: not-allowed; opacity: 0.35; }
+.mono {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  min-width: 40px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* ---------------- 响应式（完整优化在 v0.7） ---------------- */
+@media (max-width: 780px) {
+  #hud { transform: scale(0.88); transform-origin: top left; }
+  .brand h1 { font-size: 15px; }
+  .subtitle { display: none; }
+  .btn { padding: 7px 13px; font-size: 12px; }
+  input[type="range"] { width: 110px; }
+}

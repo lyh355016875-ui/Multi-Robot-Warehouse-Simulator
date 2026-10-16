@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>多机器人智能仓库仿真</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- 顶部标题栏 -->
+    <header id="topbar" class="glass">
+      <div class="brand">
+        <svg class="logo" width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+          <defs>
+            <linearGradient id="logoGrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#3B82F6"/>
+              <stop offset="1" stop-color="#22D3EE"/>
+            </linearGradient>
+          </defs>
+          <rect x="2" y="2" width="30" height="30" rx="9" fill="url(#logoGrad)"/>
+          <g stroke="#0B1220" stroke-width="2.6" stroke-linecap="round" opacity="0.82">
+            <path d="M9 12h16M9 22h16"/>
+          </g>
+          <circle cx="17" cy="17" r="3.2" fill="#0B1220"/>
+          <circle cx="17" cy="17" r="1.9" fill="#E2E8F0"/>
+        </svg>
+        <div class="brand-text">
+          <h1>多机器人智能仓库仿真</h1>
+          <span class="subtitle">Multi-Robot Warehouse Simulator</span>
+        </div>
+      </div>
+      <span id="runStatus" class="badge"><i class="pulse-dot"></i>场景就绪</span>
+    </header>
+
+    <!-- 仿真舞台 -->
+    <main id="stage">
+      <canvas id="cv"></canvas>
+
+      <!-- 左侧状态面板 -->
+      <aside id="hud" class="glass">
+        <h2>运行状态</h2>
+        <div class="stat"><span class="stat-label">机器人</span><span class="stat-value" id="statRobots">0</span></div>
+        <div class="stat"><span class="stat-label">已完成配送</span><span class="stat-value" id="statDelivered">0</span></div>
+        <div class="stat"><span class="stat-label">剩余货物</span><span class="stat-value" id="statCargo">0</span></div>
+        <div class="stat"><span class="stat-label">运行时间</span><span class="stat-value" id="statTime">00:00</span></div>
+        <div class="divider"></div>
+        <div class="legend">
+          <div class="legend-item"><i class="dot home"></i>主站 HOME</div>
+          <div class="legend-item"><i class="dot drop"></i>卸货区 DROP</div>
+          <div class="legend-item"><i class="dot shelf"></i>货架区 18 货位</div>
+        </div>
+        <div class="hint">仿真功能自 v0.2 起逐步启用</div>
+      </aside>
+    </main>
+
+    <!-- 底部控制栏 -->
+    <footer id="controls" class="glass">
+      <div class="ctrl-group">
+        <button id="btnPause" class="btn primary" disabled>暂停</button>
+        <button id="btnReset" class="btn" disabled>重置</button>
+        <button id="btnCargo" class="btn" disabled>随机货物</button>
+        <button id="btnRobot" class="btn" disabled>＋ 机器人</button>
+      </div>
+      <div class="ctrl-group speed-group">
+        <label for="speedRange">速度</label>
+        <input type="range" id="speedRange" min="0.5" max="3" step="0.1" value="1" disabled>
+        <span id="speedVal" class="mono">1.0×</span>
+      </div>
+    </footer>
+
+  </div>
+  <script src="main.js"></script>
+</body>
+</html>
