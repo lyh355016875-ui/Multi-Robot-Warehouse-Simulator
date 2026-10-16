@@ -32,14 +32,7 @@ const CFG = {
     { row: 'C', x0: 8, y0: 13, x1: 19, y1: 14 },
   ],
 
-  // v0.3 固定货物出生点（货架格：货物摆在货架上，机器人到相邻通道格取货）
-  CARGO_SPOTS: [
-    [8, 3], [14, 4], [18, 3],   // A 排
-    [10, 8], [16, 9],           // B 排
-    [8, 13], [12, 14], [16, 13],// C 排
-  ],
-
-  // 货物包装色板（中饱和、彼此和谐）
+  // 货物包装色板（中饱和、彼此和谐）；货物位于随机货架格
   CARGO_COLORS: ['#F59E0B', '#10B981', '#8B5CF6', '#EC4899',
                  '#06B6D4', '#84CC16', '#F97316', '#6366F1'],
 
@@ -556,20 +549,86 @@ class Simulation {
     this.cargos = [];
     this.delivered = 0;
     this.elapsed = 0;         // 累计运行毫秒
-    this.speedMult = 1;       // 速度倍率（v0.5 接滑块）
+    this.speedMult = 1;       // 速度倍率（滑块控制）
+    this.paused = false;      // 暂停标志（暂停时可编辑障碍，时间冻结）
     this.collisions = 0;      // 碰撞守卫计数（必须恒为 0）
-    this.rng = mulberry32(7); // 让位方向等随机性（确定性种子）
+    this.rng = mulberry32(7); // 随机源（重置时换种子）
 
-    // v0.3：三个机器人，主站停车位出发
+    // 三个机器人，主站停车位出发
     this.addRobot(2, 13);
     this.addRobot(3, 13);
     this.addRobot(4, 13);
-    this.spawnCargos(CFG.CARGO_SPOTS);
+    this.spawnRandomCargos();
   }
 
-  spawnCargos(spots) {
-    this.cargos = spots.map(([x, y], i) =>
-      new Cargo(i + 1, x, y, CFG.CARGO_COLORS[i % CFG.CARGO_COLORS.length]));
+  /** 随机生成货物：8~12 个，位于随机货架格（保证至少一个可用拣货位） */
+  spawnRandomCargos(fixedCount) {
+    const spots = [];
+    for (const s of CFG.SHELVES)
+      for (let y = s.y0; y <= s.y1; y++)
+        for (let x = s.x0; x <= s.x1; x++) spots.push([x, y]);
+    // Fisher-Yates 洗牌
+    for (let i = spots.length - 1; i > 0; i--) {
+      const j = Math.floor(this.rng() * (i + 1));
+      [spots[i], spots[j]] = [spots[j], spots[i]];
+    }
+    const n = fixedCount || 8 + Math.floor(this.rng() * 5);   // 8~12
+    const chosen = [];
+    for (const [x, y] of spots) {
+      if (chosen.length >= n) break;
+      const reachable = [[1, 0], [-1, 0], [0, 1], [0, -1]]
+        .some(([dx, dy]) => this.grid.walkable(x + dx, y + dy));
+      if (reachable) chosen.push([x, y]);
+    }
+    this.cargos = chosen.map(([x, y], i) => new Cargo(
+      i + 1, x, y,
+      CFG.CARGO_COLORS[Math.floor(this.rng() * CFG.CARGO_COLORS.length)],
+    ));
+
+    // 清空所有机器人任务（载货中的货物随之消失），原地重新接单
+    for (const r of this.robots) {
+      r.cargo = null;
+      r.path = [];
+      r.state = RS.IDLE;
+      r.taskState = RS.IDLE;
+      r.needReplan = false;
+      r.blockedMs = 0;
+      r.replanCooldown = 0;
+      if (r.moving) {          // 立即完成当前步，避免悬在半格
+        r.gx = r.toX; r.gy = r.toY;
+        r.moving = false; r.moveT = 0; r.leftover = 0;
+      }
+    }
+    this.delivered = 0;
+  }
+
+  /** 重置仿真：清障碍、机器人回主站、随机新货物、计时归零 */
+  reset() {
+    this.grid.rebuild();
+    this.robots = [];
+    this.addRobot(2, 13);
+    this.addRobot(3, 13);
+    this.addRobot(4, 13);
+    this.delivered = 0;
+    this.elapsed = 0;
+    this.collisions = 0;
+    this.paused = false;
+    this.rng = mulberry32((Date.now() & 0x7fffffff) >>> 0);   // 每次重置换新种子
+    this.spawnRandomCargos();
+  }
+
+  /** 增加机器人：优先主站停车位 → 主站任意空闲格；上限 8 */
+  addRobotAuto() {
+    if (this.robots.length >= CFG.MAX_ROBOTS) return null;
+    const occupied = new Set(this.robots.map(r => `${r.gx},${r.gy}`));
+    const candidates = [];
+    for (let i = 0; i < 3; i++) candidates.push([CFG.HOME.x0 + 1 + i, CFG.HOME.y0]);   // 停车位
+    for (let y = CFG.HOME.y1; y >= CFG.HOME.y0; y--)                                   // 主站其余格
+      for (let x = CFG.HOME.x0; x <= CFG.HOME.x1; x++) candidates.push([x, y]);
+    for (const [x, y] of candidates) {
+      if (!occupied.has(`${x},${y}`) && this.grid.walkable(x, y)) return this.addRobot(x, y);
+    }
+    return null;
   }
 
   addRobot(x, y) {
@@ -595,7 +654,8 @@ class Simulation {
   placeObstacle(x, y) {
     if (!this.canPlaceObstacle(x, y)) return false;
     this.grid.cells[y][x] = CELL.OBST;
-    this.grid.obstacles.set(`${x},${y}`, { x, y, born: this.elapsed });
+    // born 用真实时间：暂停时弹入动画照常播完（仿真时间冻结）
+    this.grid.obstacles.set(`${x},${y}`, { x, y, born: performance.now() });
     this.onObstaclesChanged();
     return true;
   }
@@ -756,6 +816,7 @@ class Simulation {
   }
 
   update(dt) {
+    if (this.paused) return;
     this.elapsed += dt;
     // 三段式调度：决策轮按 id 顺序，前序机器人释放的格子同帧可用（链式前进）
     for (const r of this.robots) r.updateMove(dt, this);
@@ -1207,7 +1268,7 @@ class Renderer {
     for (const ob of this.grid.obstacles.values()) {
       const cx = this.cx(ob.x), cy = this.cy(ob.y);
       const cs = this.cs;
-      const age = this.sim.elapsed - ob.born;
+      const age = performance.now() - ob.born;
       const k = age >= 260 ? 1 : Math.max(0.01, easeOutBack(clamp(age / 260, 0, 1)));
 
       c.save();
@@ -1484,15 +1545,155 @@ class Renderer {
   }
 }
 
+/* ---------------- UI：DOM 面板绑定 / tooltip / 任务完成浮层 ---------------- */
+class UI {
+  constructor(sim, renderer) {
+    this.sim = sim;
+    this.renderer = renderer;
+    const $ = (id) => document.getElementById(id);
+    this.el = {
+      robots: $('statRobots'), delivered: $('statDelivered'),
+      cargo: $('statCargo'), time: $('statTime'),
+      badge: $('runStatus'), stage: $('stage'),
+      pause: $('btnPause'), reset: $('btnReset'), cargoBtn: $('btnCargo'),
+      robotBtn: $('btnRobot'), speed: $('speedRange'), speedVal: $('speedVal'),
+      tooltip: $('tooltip'), overlay: $('doneOverlay'),
+      doneStats: $('doneStats'), again: $('btnAgain'),
+    };
+    this.bind();
+    this.updateHud();
+  }
+
+  bind() {
+    this.el.pause.addEventListener('click', () => {
+      this.sim.paused = !this.sim.paused;
+      this.updateHud();
+    });
+    this.el.reset.addEventListener('click', () => { this.sim.reset(); this.updateHud(); });
+    this.el.cargoBtn.addEventListener('click', () => { this.sim.spawnRandomCargos(); this.updateHud(); });
+    this.el.robotBtn.addEventListener('click', () => { this.sim.addRobotAuto(); this.updateHud(); });
+    this.el.again.addEventListener('click', () => { this.sim.spawnRandomCargos(); this.updateHud(); });
+    this.el.speed.addEventListener('input', () => {
+      this.sim.speedMult = parseFloat(this.el.speed.value);
+      this.el.speedVal.textContent = this.sim.speedMult.toFixed(1) + '×';
+    });
+    this.bindTooltip();
+  }
+
+  stateText(r) {
+    switch (r.state) {
+      case RS.IDLE: return '空闲';
+      case RS.TO_PICKUP: return '前往取货';
+      case RS.CARRYING: return '载货 → 卸货区';
+      case RS.WAITING: return '等待通行';
+      case RS.REPLANNING: return '重新规划中';
+      default: return r.state;
+    }
+  }
+
+  /** 悬停格上的机器人（当前格或移动目标格） */
+  robotAt(cell) {
+    for (const r of this.sim.robots) {
+      if (r.gx === cell.x && r.gy === cell.y) return r;
+      if (r.moving && r.toX === cell.x && r.toY === cell.y) return r;
+    }
+    return null;
+  }
+
+  bindTooltip() {
+    const cv = this.renderer.canvas;
+    cv.addEventListener('mousemove', (e) => {
+      const cell = this.renderer.cellFromEvent(e);
+      let html = null;
+      if (cell) {
+        const r = this.robotAt(cell);
+        if (r) {
+          const goal = r.path.length ? r.path[r.path.length - 1] : null;
+          html = `<div class="tt-title"><i style="background:${r.color};box-shadow:0 0 6px ${r.color}"></i>机器人 #${r.id}</div>`
+            + `<div class="tt-row">状态：${this.stateText(r)}</div>`
+            + `<div class="tt-row">载货：${r.cargo ? `货物 #${r.cargo.id}` : '无'}</div>`
+            + (goal ? `<div class="tt-row">目标：(${goal.x}, ${goal.y})</div>` : '');
+        } else {
+          const t = this.sim.grid.at(cell.x, cell.y);
+          const label = t === CELL.SHELF ? '货架'
+            : t === CELL.HOME ? '主站'
+            : t === CELL.DROP ? '卸货区'
+            : t === CELL.OBST ? '障碍'
+            : '通道';
+          const pass = (t === CELL.FLOOR || t === CELL.HOME || t === CELL.DROP) ? '可通行' : '不可通行';
+          html = `<div class="tt-title">格子 (${cell.x}, ${cell.y})</div>`
+            + `<div class="tt-row">${label} · ${pass}</div>`;
+        }
+      }
+      this.showTooltip(html, e);
+    });
+    cv.addEventListener('mouseleave', () => this.showTooltip(null, null));
+  }
+
+  showTooltip(html, e) {
+    const el = this.el.tooltip;
+    if (!html) { el.classList.remove('show'); return; }
+    el.innerHTML = html;
+    el.classList.add('show');
+    // 跟随鼠标（右下偏移，出界翻转）
+    const pad = 14;
+    let x = e.clientX + pad, y = e.clientY + pad;
+    const r = el.getBoundingClientRect();
+    if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - pad;
+    if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - pad;
+    el.style.left = x + 'px';
+    el.style.top = y + 'px';
+  }
+
+  fmtTime(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  /** HUD + 徽章 + 按钮态 + 任务完成浮层（低频调用） */
+  updateHud() {
+    const sim = this.sim;
+    this.el.robots.textContent = String(sim.robots.length);
+    this.el.delivered.textContent = String(sim.delivered);
+    this.el.cargo.textContent = String(sim.remainingCargo);
+    this.el.time.textContent = this.fmtTime(sim.elapsed);
+
+    const b = this.el.badge;
+    if (sim.allDelivered) {
+      b.className = 'badge done';
+      b.innerHTML = '<i class="pulse-dot"></i>任务完成';
+    } else if (sim.paused) {
+      b.className = 'badge paused';
+      b.innerHTML = '<i class="pulse-dot"></i>已暂停';
+    } else {
+      b.className = 'badge';
+      b.innerHTML = '<i class="pulse-dot"></i>运行中';
+    }
+
+    this.el.pause.textContent = sim.paused ? '继续' : '暂停';
+    this.el.robotBtn.disabled = sim.robots.length >= CFG.MAX_ROBOTS;
+    this.el.stage.classList.toggle('paused', sim.paused);
+
+    const showDone = sim.allDelivered && !sim.paused;
+    this.el.overlay.classList.toggle('show', showDone);
+    if (showDone) {
+      this.el.doneStats.textContent =
+        `共 ${sim.cargos.length} 件货物全部送达 · 用时 ${this.fmtTime(sim.elapsed)} · 碰撞 ${sim.collisions}`;
+    }
+  }
+}
+
 /* ---------------- 启动 ---------------- */
 (function boot() {
   const grid = new Grid();
   const sim = new Simulation(grid);
   const canvas = document.getElementById('cv');
   const renderer = new Renderer(canvas, grid, sim);
+  const ui = new UI(sim, renderer);
 
   window.__sim = sim;           // 调试 / 自测钩子
   window.__renderer = renderer;
+  window.__ui = ui;
   renderer.bindInput();
 
   const onResize = () => renderer.resize();
@@ -1501,31 +1702,6 @@ class Renderer {
     new ResizeObserver(onResize).observe(canvas.parentElement);
   }
   renderer.resize();
-
-  /* ----- HUD 低频刷新（4 次/秒） ----- */
-  const $ = (id) => document.getElementById(id);
-  const elRobots = $('statRobots'), elDelivered = $('statDelivered'),
-        elCargo = $('statCargo'), elTime = $('statTime'), elBadge = $('runStatus');
-
-  function fmtTime(ms) {
-    const s = Math.floor(ms / 1000);
-    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-  }
-
-  function updateHud() {
-    elRobots.textContent = String(sim.robots.length);
-    elDelivered.textContent = String(sim.delivered);
-    elCargo.textContent = String(sim.remainingCargo);
-    elTime.textContent = fmtTime(sim.elapsed);
-    if (sim.allDelivered) {
-      elBadge.className = 'badge done';
-      elBadge.innerHTML = '<i class="pulse-dot"></i>任务完成';
-    } else {
-      elBadge.className = 'badge';
-      elBadge.innerHTML = '<i class="pulse-dot"></i>运行中';
-    }
-  }
-  updateHud();
 
   /* ----- 主循环：逻辑与渲染分离 ----- */
   let last = performance.now();
@@ -1539,7 +1715,7 @@ class Renderer {
     renderer.render(t);
 
     hudTimer += dt;
-    if (hudTimer >= 250) { hudTimer = 0; updateHud(); }
+    if (hudTimer >= 250) { hudTimer = 0; ui.updateHud(); }
 
     requestAnimationFrame(frame);
   }

@@ -112,6 +112,19 @@ body::before {
   box-shadow: 0 0 8px #4ADE80;
 }
 
+/* 已暂停徽章（黄色） */
+.badge.paused {
+  background: rgba(250, 204, 21, 0.10);
+  border-color: rgba(250, 204, 21, 0.35);
+  color: #FDE68A;
+}
+.badge.paused .pulse-dot {
+  background: #FACC15;
+  box-shadow: 0 0 8px #FACC15;
+  animation: none;
+  opacity: 0.7;
+}
+
 /* ---------------- 舞台与画布 ---------------- */
 #stage { position: relative; flex: 1; min-height: 0; }
 
@@ -123,6 +136,89 @@ body::before {
   display: block;
   border-radius: var(--radius);
   cursor: crosshair;
+  transition: filter 0.25s ease;
+}
+
+/* 暂停时画面降饱和 */
+#stage.paused #cv {
+  filter: saturate(0.72) brightness(0.82);
+}
+
+/* ---------------- 悬停提示 ---------------- */
+#tooltip {
+  position: fixed;
+  z-index: 60;
+  pointer-events: none;
+  min-width: 118px;
+  padding: 8px 12px;
+  background: rgba(10, 16, 30, 0.94);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--dim);
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+#tooltip.show { opacity: 1; transform: translateY(0); }
+.tt-title {
+  color: var(--text);
+  font-weight: 650;
+  margin-bottom: 2px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tt-title i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: none;
+}
+.tt-row { white-space: nowrap; }
+
+/* ---------------- 任务完成浮层 ---------------- */
+#doneOverlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(7, 11, 22, 0.45);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  border-radius: var(--radius);
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.3s ease, visibility 0.3s;
+}
+#doneOverlay.show { opacity: 1; visibility: visible; }
+
+.done-card {
+  text-align: center;
+  padding: 30px 48px 28px;
+  animation: donePop 0.45s cubic-bezier(0.2, 1.4, 0.4, 1);
+}
+@keyframes donePop {
+  from { transform: scale(0.82); opacity: 0; }
+}
+.done-check { filter: drop-shadow(0 0 12px rgba(74, 222, 128, 0.5)); }
+.done-card h3 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 3px;
+  color: #86EFAC;
+  margin: 12px 0 6px;
+}
+.done-card p {
+  font-size: 13px;
+  color: var(--dim);
+  margin-bottom: 20px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------------- 左侧状态面板 ---------------- */
