@@ -101,6 +101,17 @@ body::before {
 }
 @keyframes pulse { 50% { opacity: 0.35; } }
 
+/* 任务完成徽章（绿色） */
+.badge.done {
+  background: rgba(34, 197, 94, 0.12);
+  border-color: rgba(34, 197, 94, 0.4);
+  color: #86EFAC;
+}
+.badge.done .pulse-dot {
+  background: #4ADE80;
+  box-shadow: 0 0 8px #4ADE80;
+}
+
 /* ---------------- 舞台与画布 ---------------- */
 #stage { position: relative; flex: 1; min-height: 0; }
 

@@ -1,19 +1,18 @@
 'use strict';
 /* ============================================================
  * 多机器人智能仓库仿真 · main.js
- * v0.1.0 — 静态仓库场景：地板 / 网格 / 货架 / 主站 / 卸货区
+ * 当前版本 v0.2.0 — 单机器人取送货
  *
  * 架构：
- *   - 逻辑与渲染分离，requestAnimationFrame 单循环驱动
- *   - 静态层（地板、网格、货架、主站、卸货区）预渲染到离屏 Canvas，
- *     每帧仅一次 drawImage；动态元素（环境光效，后续版本的机器人 /
- *     货物 / 路径 / 粒子）叠加在其上
+ *   - 逻辑（Simulation.update）与渲染（Renderer.render）分离，
+ *     requestAnimationFrame 单循环驱动
+ *   - 静态层（地板、网格、货架、主站、卸货区）预渲染到离屏 Canvas；
+ *     动态层（路径、货物、机器人）每帧绘制
  *   - 高 DPI：backing store = CSS 尺寸 × devicePixelRatio，
  *     resize / DPR 变化时自动重建静态层
  *
- * 后续版本扩展点：
- *   v0.2 PathPlanner / Robot / Simulation
- *   v0.5 UI（DOM 面板绑定）
+ * 模块：CFG / utils / Grid / PathPlanner(A*) / Cargo / Robot /
+ *       Simulation / Renderer / boot
  * ============================================================ */
 
 /* ---------------- 全局配置 ---------------- */
@@ -33,9 +32,21 @@ const CFG = {
     { row: 'C', x0: 8, y0: 13, x1: 19, y1: 14 },
   ],
 
+  // v0.2 固定货物出生点（货架旁可通行格）
+  CARGO_SPOTS: [
+    [10, 2], [16, 2],    // A 排上方通道
+    [8, 6], [14, 6],     // A/B 之间通道
+    [10, 11], [17, 11],  // B/C 之间通道
+    [8, 15], [15, 15],   // C 排下方通道
+  ],
+
+  // 货物包装色板（中饱和、彼此和谐）
+  CARGO_COLORS: ['#F59E0B', '#10B981', '#8B5CF6', '#EC4899',
+                 '#06B6D4', '#84CC16', '#F97316', '#6366F1'],
+
   PAL: {
     pageBg: '#0B1220',
-    outside: '#0A0F1C',                    // 画布网格区域之外的暗色
+    outside: '#0A0F1C',
     floor: '#111C2E',
     gridLine: 'rgba(148,163,184,0.08)',
     shelfTop: '#26364D',
@@ -53,13 +64,16 @@ const CFG = {
   ROBOT_COLORS: ['#38BDF8', '#F472B6', '#FACC15', '#4ADE80',
                  '#A78BFA', '#FB923C', '#F87171', '#2DD4BF'],
   MAX_ROBOTS: 8,
+
+  MOVE_MS: 320,          // 基准：每格移动耗时（250~400ms 区间中值）
+  TURN_MS: 160,          // 转向平滑常数
 };
 
 /* ---------------- 通用工具 ---------------- */
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, t) => a + (b - a) * t;
 
-/** 确定性随机（mulberry32）：静态纹理用固定种子，重建结果一致 */
+/** 确定性随机（mulberry32） */
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -68,6 +82,31 @@ function mulberry32(seed) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+/** 角度归一化到 (-π, π] */
+function wrapAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a <= -Math.PI) a += Math.PI * 2;
+  return a;
+}
+
+/** 颜色调节：k>0 变亮、k<0 变暗，返回 rgb() 字符串 */
+function shade(hex, k) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  if (k >= 0) {
+    r += (255 - r) * k; g += (255 - g) * k; b += (255 - b) * k;
+  } else {
+    r *= (1 + k); g *= (1 + k); b *= (1 + k);
+  }
+  return `rgb(${r | 0},${g | 0},${b | 0})`;
+}
+
+/** hex → rgba() */
+function withA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
 
 /** 圆角矩形路径（不依赖较新的 ctx.roundRect） */
@@ -131,16 +170,301 @@ class Grid {
   }
 }
 
+/* ============================================================
+ * A* 路径规划器
+ * 四方向 + 曼哈顿启发 + 二叉堆开放列表（借鉴 PathFinding.js）
+ * blocked：临时不可通行格集合（"x,y" 字符串，v0.3 起传入机器人占用）
+ * ============================================================ */
+class MinHeap {
+  constructor() { this.a = []; }
+  get size() { return this.a.length; }
+
+  /** n: {f, h}，f 小者先出；f 相同时 h 小者先出（少 tie 抖动） */
+  push(n) {
+    const a = this.a;
+    a.push(n);
+    let i = a.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (a[p].f < a[i].f || (a[p].f === a[i].f && a[p].h <= a[i].h)) break;
+      [a[p], a[i]] = [a[i], a[p]];
+      i = p;
+    }
+  }
+
+  pop() {
+    const a = this.a;
+    const top = a[0];
+    const last = a.pop();
+    if (a.length > 0) {
+      a[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = i * 2 + 1, r = l + 1;
+        let m = i;
+        if (l < a.length && (a[l].f < a[m].f || (a[l].f === a[m].f && a[l].h < a[m].h))) m = l;
+        if (r < a.length && (a[r].f < a[m].f || (a[r].f === a[m].f && a[r].h < a[m].h))) m = r;
+        if (m === i) break;
+        [a[m], a[i]] = [a[i], a[m]];
+        i = m;
+      }
+    }
+    return top;
+  }
+}
+
+class PathPlanner {
+  constructor(grid) { this.grid = grid; }
+
+  /**
+   * 求最短路径。返回 [{x,y}, ...]（不含 start，含 goal）；不可达返回 null。
+   */
+  findPath(start, goal, blocked) {
+    const { COLS, ROWS } = CFG;
+    if (start.x === goal.x && start.y === goal.y) return [];
+    if (!this.grid.walkable(goal.x, goal.y)) return null;
+    if (blocked && blocked.has(`${goal.x},${goal.y}`)) return null;
+
+    const N = COLS * ROWS;
+    const g = new Float64Array(N).fill(Infinity);
+    const came = new Int32Array(N).fill(-1);
+    const closed = new Uint8Array(N);
+    const idx = (x, y) => y * COLS + x;
+    const hOf = (x, y) => Math.abs(x - goal.x) + Math.abs(y - goal.y);
+
+    const heap = new MinHeap();
+    const sIdx = idx(start.x, start.y);
+    g[sIdx] = 0;
+    heap.push({ x: start.x, y: start.y, g: 0, f: hOf(start.x, start.y), h: hOf(start.x, start.y) });
+
+    const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const goalIdx = idx(goal.x, goal.y);
+
+    while (heap.size > 0) {
+      const cur = heap.pop();
+      const ci = idx(cur.x, cur.y);
+      if (closed[ci]) continue;
+      closed[ci] = 1;
+      if (ci === goalIdx) break;
+
+      for (const [dx, dy] of DIRS) {
+        const nx = cur.x + dx, ny = cur.y + dy;
+        if (!this.grid.walkable(nx, ny)) continue;
+        if (blocked && blocked.has(`${nx},${ny}`)) continue;
+        const ni = idx(nx, ny);
+        if (closed[ni]) continue;
+        const ng = g[ci] + 1;
+        if (ng < g[ni]) {
+          g[ni] = ng;
+          came[ni] = ci;
+          const h = hOf(nx, ny);
+          heap.push({ x: nx, y: ny, g: ng, f: ng + h, h });
+        }
+      }
+    }
+
+    if (came[goalIdx] === -1 && goalIdx !== sIdx) return null;
+
+    // 回溯
+    const path = [];
+    let i = goalIdx;
+    while (i !== sIdx && i !== -1) {
+      path.push({ x: i % COLS, y: (i / COLS) | 0 });
+      i = came[i];
+    }
+    path.reverse();
+    return path.length > 0 ? path : null;
+  }
+}
+
+/* ---------------- 货物 ---------------- */
+class Cargo {
+  constructor(id, x, y, color) {
+    this.id = id;
+    this.x = x; this.y = y;
+    this.color = color;
+    this.assignedTo = null;   // 已分配的机器人 id（null = 未分配）
+    this.collected = false;   // 已被取走（地面消失，随机器人移动）
+    this.delivered = false;   // 已送达
+  }
+}
+
+/* ---------------- 机器人 ---------------- */
+const RS = {
+  IDLE: 'idle',
+  TO_PICKUP: 'toPickup',
+  CARRYING: 'carrying',
+  WAITING: 'waiting',        // v0.3 起使用
+  REPLANNING: 'replanning',  // v0.4 起使用
+};
+
+class Robot {
+  constructor(id, gx, gy) {
+    this.id = id;
+    this.gx = gx; this.gy = gy;        // 当前逻辑格
+    this.fromX = gx; this.fromY = gy;  // 当前移动步起点
+    this.toX = gx; this.toY = gy;      // 当前移动步终点
+    this.moving = false;
+    this.moveT = 0;                    // 当前步进度 0..1
+    this.angle = -Math.PI / 2;         // 初始朝上
+    this.targetAngle = this.angle;
+    this.state = RS.IDLE;
+    this.path = [];                    // 剩余路径 [{x,y}, ...]
+    this.cargo = null;                 // 已接单 / 载运的货物
+    this.color = CFG.ROBOT_COLORS[id % CFG.ROBOT_COLORS.length];
+    this.blocked = 0;                  // 连续受阻计数（v0.3 死锁解除用）
+  }
+
+  /** 渲染插值位置（浮点格坐标） */
+  renderPos() {
+    if (!this.moving) return { x: this.gx, y: this.gy };
+    return {
+      x: lerp(this.fromX, this.toX, this.moveT),
+      y: lerp(this.fromY, this.toY, this.moveT),
+    };
+  }
+
+  beginStep() {
+    const n = this.path[0];
+    this.fromX = this.gx; this.fromY = this.gy;
+    this.toX = n.x; this.toY = n.y;
+    this.moving = true;
+    const dx = this.toX - this.fromX, dy = this.toY - this.fromY;
+    if (dx !== 0 || dy !== 0) this.targetAngle = Math.atan2(dy, dx);
+  }
+
+  finishStep() {
+    this.gx = this.toX; this.gy = this.toY;
+    this.path.shift();
+  }
+
+  /** 每帧逻辑：推进移动、状态转换、平滑转向 */
+  update(dt, sim) {
+    if (!this.moving && this.path.length > 0) this.beginStep();
+
+    if (this.moving) {
+      this.moveT += (dt * sim.speedMult) / CFG.MOVE_MS;
+      if (this.moveT >= 1) {
+        const leftover = this.moveT - 1;
+        this.finishStep();
+        if (this.path.length === 0) this.onArrive(sim);
+        if (this.path.length > 0) {
+          this.beginStep();
+          this.moveT = leftover;
+        } else {
+          this.moving = false;
+          this.moveT = 0;
+        }
+      }
+    } else if (this.state === RS.IDLE) {
+      this.onIdle(sim);
+    }
+
+    // 平滑转向
+    const da = wrapAngle(this.targetAngle - this.angle);
+    if (Math.abs(da) < 0.02) {
+      this.angle = this.targetAngle;
+    } else {
+      this.angle = wrapAngle(this.angle + da * Math.min(1, dt / CFG.TURN_MS));
+    }
+  }
+
+  /** 空闲：认领最近未分配货物并规划取货路径 */
+  onIdle(sim) {
+    let best = null, bd = Infinity;
+    for (const c of sim.cargos) {
+      if (c.assignedTo !== null || c.collected) continue;
+      const d = Math.abs(c.x - this.gx) + Math.abs(c.y - this.gy);
+      if (d < bd) { bd = d; best = c; }
+    }
+    if (!best) return;
+    const path = sim.planner.findPath({ x: this.gx, y: this.gy }, { x: best.x, y: best.y });
+    if (!path) return;
+    best.assignedTo = this.id;
+    this.cargo = best;
+    this.state = RS.TO_PICKUP;
+    this.path = path;
+  }
+
+  /** 到达路径终点：取货 / 交付 */
+  onArrive(sim) {
+    if (this.state === RS.TO_PICKUP && this.cargo) {
+      this.cargo.collected = true;
+      this.state = RS.CARRYING;
+      const goal = sim.nearestDropCell(this.gx, this.gy);
+      this.path = goal ? (sim.planner.findPath({ x: this.gx, y: this.gy }, goal) || []) : [];
+    } else if (this.state === RS.CARRYING) {
+      const c = this.cargo;
+      this.cargo = null;
+      this.state = RS.IDLE;
+      if (c) c.delivered = true;
+      sim.delivered++;
+    }
+  }
+}
+
+/* ---------------- 仿真调度 ---------------- */
+class Simulation {
+  constructor(grid) {
+    this.grid = grid;
+    this.planner = new PathPlanner(grid);
+    this.robots = [];
+    this.cargos = [];
+    this.delivered = 0;
+    this.elapsed = 0;        // 累计运行毫秒（不含暂停，暂停 v0.5）
+    this.speedMult = 1;      // 速度倍率（v0.5 接滑块）
+
+    this.addRobot(2, 13);    // v0.2：单机器人，主站停车位
+
+    CFG.CARGO_SPOTS.forEach(([x, y], i) => {
+      this.cargos.push(new Cargo(i + 1, x, y, CFG.CARGO_COLORS[i % CFG.CARGO_COLORS.length]));
+    });
+  }
+
+  addRobot(x, y) {
+    const r = new Robot(this.robots.length, x, y);
+    this.robots.push(r);
+    return r;
+  }
+
+  /** 距离 (x,y) 最近的卸货格（v0.3 起还会排除占用格） */
+  nearestDropCell(x, y) {
+    const z = CFG.DROP;
+    let best = null, bd = Infinity;
+    for (let cy = z.y0; cy <= z.y1; cy++) {
+      for (let cx = z.x0; cx <= z.x1; cx++) {
+        if (!this.grid.walkable(cx, cy)) continue;
+        const d = Math.abs(cx - x) + Math.abs(cy - y);
+        if (d < bd) { bd = d; best = { x: cx, y: cy }; }
+      }
+    }
+    return best;
+  }
+
+  update(dt) {
+    this.elapsed += dt;
+    for (const r of this.robots) r.update(dt, this);
+  }
+
+  get allDelivered() {
+    return this.cargos.length > 0 && this.cargos.every(c => c.delivered);
+  }
+  get remainingCargo() {
+    return this.cargos.filter(c => !c.collected && !c.delivered).length;
+  }
+}
+
 /* ---------------- 渲染器 ---------------- */
 class Renderer {
-  constructor(canvas, grid) {
+  constructor(canvas, grid, sim) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.grid = grid;
-    this.dpr = 0;          // resize() 内会真正赋值
-    this.cs = 32;          // 单格 CSS 像素尺寸
-    this.ox = 0; this.oy = 0;   // 网格区域在画布内的原点（居中 letterbox）
-    this.gw = 0; this.gh = 0;   // 网格区域像素尺寸
+    this.sim = sim;
+    this.dpr = 0;
+    this.cs = 32;
+    this.ox = 0; this.oy = 0;
+    this.gw = 0; this.gh = 0;
     this.staticLayer = document.createElement('canvas');
   }
 
@@ -155,7 +479,6 @@ class Renderer {
     this.canvas.width = Math.round(cssW * dpr);
     this.canvas.height = Math.round(cssH * dpr);
 
-    // 网格铺满可用区域（四周留 12px 呼吸空间），格子尺寸限幅
     this.cs = clamp(Math.floor(Math.min((cssW - 24) / CFG.COLS, (cssH - 24) / CFG.ROWS)), 14, 48);
     this.gw = this.cs * CFG.COLS;
     this.gh = this.cs * CFG.ROWS;
@@ -168,6 +491,9 @@ class Renderer {
   /* ----- 坐标换算 ----- */
   px(x) { return this.ox + x * this.cs; }
   py(y) { return this.oy + y * this.cs; }
+  /** 浮点格坐标 → 像素中心 */
+  cx(x) { return this.ox + x * this.cs + this.cs / 2; }
+  cy(y) { return this.oy + y * this.cs + this.cs / 2; }
 
   /* ============================================================
    * 静态层：一次性绘制，resize 时重建
@@ -179,11 +505,9 @@ class Renderer {
     const c = s.getContext('2d');
     c.scale(this.dpr, this.dpr);
 
-    // 网格区域之外的暗色底
     c.fillStyle = CFG.PAL.outside;
     c.fillRect(0, 0, this.cssW, this.cssH);
 
-    // 地板（带投影，形成"悬浮桌面"感）
     c.save();
     c.shadowColor = 'rgba(0,0,0,0.55)';
     c.shadowBlur = 28;
@@ -193,7 +517,6 @@ class Renderer {
     c.fill();
     c.restore();
 
-    // 地板内部细节全部裁剪在圆角内
     c.save();
     rr(c, this.ox, this.oy, this.gw, this.gh, 12);
     c.clip();
@@ -210,7 +533,6 @@ class Renderer {
 
     c.restore();
 
-    // 外边框
     rr(c, this.ox + 0.5, this.oy + 0.5, this.gw - 1, this.gh - 1, 12);
     c.strokeStyle = 'rgba(148,163,184,0.16)';
     c.lineWidth = 1;
@@ -227,10 +549,10 @@ class Renderer {
     const rnd = mulberry32(20261015);
     const d = img.data;
     for (let i = 0; i < d.length; i += 4) {
-      const n = (rnd() - 0.5) * 2;         // -1 ~ 1
+      const n = (rnd() - 0.5) * 2;
       const v = n > 0 ? 255 : 0;
       d[i] = d[i + 1] = d[i + 2] = v;
-      d[i + 3] = Math.floor(Math.abs(n) * 12);   // alpha ≤ 12，克制
+      d[i + 3] = Math.floor(Math.abs(n) * 12);
     }
     nctx.putImageData(img, 0, 0);
     c.drawImage(nc, this.ox, this.oy, this.gw, this.gh);
@@ -245,7 +567,7 @@ class Renderer {
       c.fillStyle = g;
       c.fillRect(this.ox, this.oy, this.gw, this.gh);
     };
-    const mid = (z) => ({ x: this.px((z.x0 + z.x1 + 1) / 2), y: this.py((z.y0 + z.y1 + 1) / 2) });
+    const mid = (z) => ({ x: this.cx((z.x0 + z.x1 + 1) / 2), y: this.cy((z.y0 + z.y1 + 1) / 2) });
     const h = mid(CFG.HOME), d = mid(CFG.DROP);
     zone(h.x, h.y, this.cs * 7, 'rgba(59,130,246,0.055)');
     zone(d.x, d.y, this.cs * 7, 'rgba(34,197,94,0.055)');
@@ -310,10 +632,9 @@ class Renderer {
     const x = this.px(s.x0), y = this.py(s.y0);
     const w = (s.x1 - s.x0 + 1) * cs;
     const h = (s.y1 - s.y0 + 1) * cs;
-    const depth = Math.max(3, Math.round(cs * 0.14));   // 侧面（前立面）厚度
+    const depth = Math.max(3, Math.round(cs * 0.14));
     const rad = Math.max(5, Math.round(cs * 0.18));
 
-    // 投影
     c.save();
     c.shadowColor = 'rgba(0,0,0,0.5)';
     c.shadowBlur = 14;
@@ -323,7 +644,6 @@ class Renderer {
     c.fill();
     c.restore();
 
-    // 顶面（略短，露出下缘侧面形成厚度感）
     const topH = h - depth;
     const g = c.createLinearGradient(0, y, 0, y + topH);
     g.addColorStop(0, '#2E4059');
@@ -332,19 +652,16 @@ class Renderer {
     c.fillStyle = g;
     c.fill();
 
-    // 顶面外框高光
     c.strokeStyle = CFG.PAL.shelfHi;
     c.lineWidth = 1;
     rr(c, x + 0.5, y + 0.5, w - 1, topH - 1, rad);
     c.stroke();
 
-    // 货位结构：每 2 格一个货位
     const bays = (s.x1 - s.x0 + 1) / 2;
     for (let i = 0; i < bays; i++) {
       const bx = x + i * 2 * cs;
       const bw = 2 * cs;
 
-      // 货位内横梁（两条）
       c.strokeStyle = CFG.PAL.shelfBeam;
       c.lineWidth = 1.5;
       c.beginPath();
@@ -354,7 +671,6 @@ class Renderer {
       }
       c.stroke();
 
-      // 货位编号（如 A3）
       c.textAlign = 'left';
       c.textBaseline = 'alphabetic';
       c.fillStyle = 'rgba(148,163,184,0.62)';
@@ -362,7 +678,6 @@ class Renderer {
       c.fillText(`${s.row}${i + 1}`, bx + 5, y + Math.max(11, topH * 0.27));
     }
 
-    // 货位分隔梁 + 立柱
     for (let i = 1; i < bays; i++) {
       const sx = x + i * 2 * cs;
       c.strokeStyle = CFG.PAL.shelfSide;
@@ -377,7 +692,6 @@ class Renderer {
         c.fill();
       }
     }
-    // 四角立柱
     c.fillStyle = CFG.PAL.shelfHi;
     for (const [cx2, cy2] of [[x + 4, y + 4], [x + w - 4, y + 4], [x + 4, y + topH - 4], [x + w - 4, y + topH - 4]]) {
       c.beginPath();
@@ -395,7 +709,6 @@ class Renderer {
     const h = (z.y1 - z.y0 + 1) * cs - pad * 2;
     const rad = Math.max(8, Math.round(cs * 0.3));
 
-    // 平台底色 + 发光边框
     c.save();
     c.shadowColor = P.homeGlow;
     c.shadowBlur = 22;
@@ -409,7 +722,6 @@ class Renderer {
     c.stroke();
     c.restore();
 
-    // 充电桩（平台左上格）
     const dx = this.px(z.x0) + cs * 0.18, dy = this.py(z.y0) + cs * 0.15;
     const dw = cs * 0.64, dh = cs * 0.70;
     rr(c, dx, dy, dw, dh, 5);
@@ -426,7 +738,6 @@ class Renderer {
     c.fill();
     c.restore();
 
-    // 停车位（虚线圆角格 × 3）
     c.setLineDash([5, 4]);
     c.strokeStyle = 'rgba(59,130,246,0.42)';
     c.lineWidth = 1.2;
@@ -437,7 +748,6 @@ class Renderer {
     }
     c.setLineDash([]);
 
-    // 标牌（平台下半部居中，两行）
     c.textAlign = 'center';
     c.textBaseline = 'middle';
     c.fillStyle = 'rgba(96,165,250,0.9)';
@@ -457,7 +767,6 @@ class Renderer {
     const h = (z.y1 - z.y0 + 1) * cs - pad * 2;
     const rad = Math.max(8, Math.round(cs * 0.3));
 
-    // 平台底色 + 发光边框
     c.save();
     c.shadowColor = P.dropGlow;
     c.shadowBlur = 22;
@@ -471,7 +780,6 @@ class Renderer {
     c.stroke();
     c.restore();
 
-    // 装卸口（左边缘朝向仓库，两扇发光门）
     for (const ry of [z.y0 + 1, z.y0 + 2]) {
       const dx = this.px(z.x0) + cs * 0.08;
       const dy = this.py(ry) + cs * 0.17;
@@ -488,7 +796,6 @@ class Renderer {
       c.restore();
     }
 
-    // 标牌（平台中央，两行）
     c.textAlign = 'center';
     c.textBaseline = 'middle';
     c.fillStyle = 'rgba(74,222,128,0.92)';
@@ -502,14 +809,15 @@ class Renderer {
   /* ============================================================
    * 动态层：每帧绘制
    * ============================================================ */
-
-  /** 每帧入口：静态层 + 环境动效（后续版本在此叠加机器人等） */
   render(t) {
     const c = this.ctx;
     c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     c.clearRect(0, 0, this.cssW, this.cssH);
     c.drawImage(this.staticLayer, 0, 0, this.cssW, this.cssH);
     this.drawAmbientFx(c, t);
+    this.drawPaths(c);
+    this.drawCargos(c);
+    this.drawRobots(c);
   }
 
   /** 环境动效：卸货区脉冲光圈 + 主站呼吸光晕 */
@@ -530,21 +838,217 @@ class Renderer {
       c.restore();
     };
 
-    // 卸货区：脉冲呼吸
     const p1 = 0.5 + 0.5 * Math.sin(t / 780);
     zoneRing(CFG.DROP, 5 + 4 * p1, 'rgba(34,197,94,0.9)', 0.10 + 0.17 * p1, 16);
 
-    // 主站：更慢、更淡的呼吸
     const p2 = 0.5 + 0.5 * Math.sin(t / 1500 + 2.1);
     zoneRing(CFG.HOME, 4 + 3 * p2, 'rgba(59,130,246,0.9)', 0.07 + 0.11 * p2, 14);
+  }
+
+  /** 路径：机器人色 30% 透明度虚线折线，随速度流动 */
+  drawPaths(c) {
+    for (const r of this.sim.robots) {
+      if (!r.moving && r.path.length === 0) continue;
+      const p0 = r.renderPos();
+      const pts = [p0, ...r.path];
+
+      c.save();
+      c.strokeStyle = withA(r.color, 0.30);
+      c.lineWidth = 2;
+      c.setLineDash([7, 6]);
+      c.lineCap = 'round';
+      c.lineJoin = 'round';
+      // 虚线沿行进方向流动，速度与机器人速度倍率关联
+      c.lineDashOffset = -(this.sim.elapsed / 45) * this.sim.speedMult;
+      c.beginPath();
+      c.moveTo(this.cx(pts[0].x), this.cy(pts[0].y));
+      for (let i = 1; i < pts.length; i++) c.lineTo(this.cx(pts[i].x), this.cy(pts[i].y));
+      c.stroke();
+      c.setLineDash([]);
+
+      // 终点标记：半透明小圆
+      const last = pts[pts.length - 1];
+      c.fillStyle = withA(r.color, 0.35);
+      c.beginPath();
+      c.arc(this.cx(last.x), this.cy(last.y), this.cs * 0.10, 0, Math.PI * 2);
+      c.fill();
+      c.restore();
+    }
+  }
+
+  /** 地面货物：带包装带的小箱子 */
+  drawCargos(c) {
+    for (const cargo of this.sim.cargos) {
+      if (cargo.collected || cargo.delivered) continue;
+      const cs = this.cs;
+      const cx = this.cx(cargo.x), cy = this.cy(cargo.y);
+      const s = cs * 0.46;
+
+      // 外圈提示环
+      c.strokeStyle = withA(cargo.color, 0.28);
+      c.lineWidth = 1.5;
+      c.beginPath();
+      c.arc(cx, cy, s * 0.82, 0, Math.PI * 2);
+      c.stroke();
+
+      // 阴影
+      c.fillStyle = 'rgba(0,0,0,0.32)';
+      c.beginPath();
+      c.ellipse(cx, cy + s * 0.42, s * 0.52, s * 0.2, 0, 0, Math.PI * 2);
+      c.fill();
+
+      // 箱体（轻微渐变）
+      const g = c.createLinearGradient(cx, cy - s / 2, cx, cy + s / 2);
+      g.addColorStop(0, shade(cargo.color, 0.28));
+      g.addColorStop(1, shade(cargo.color, -0.18));
+      rr(c, cx - s / 2, cy - s / 2, s, s, 3.5);
+      c.fillStyle = g;
+      c.fill();
+      c.strokeStyle = 'rgba(0,0,0,0.35)';
+      c.lineWidth = 1;
+      c.stroke();
+
+      // 包装带（十字）
+      c.strokeStyle = 'rgba(15,23,42,0.5)';
+      c.lineWidth = Math.max(2, s * 0.14);
+      c.beginPath();
+      c.moveTo(cx, cy - s / 2 + 1); c.lineTo(cx, cy + s / 2 - 1);
+      c.moveTo(cx - s / 2 + 1, cy); c.lineTo(cx + s / 2 - 1, cy);
+      c.stroke();
+
+      // 左上高光
+      c.strokeStyle = 'rgba(255,255,255,0.45)';
+      c.lineWidth = 1.2;
+      c.beginPath();
+      c.moveTo(cx - s / 2 + 3, cy - s / 2 + s * 0.32);
+      c.lineTo(cx - s / 2 + 3, cy - s / 2 + 3);
+      c.lineTo(cx - s / 2 + s * 0.32, cy - s / 2 + 3);
+      c.stroke();
+    }
+  }
+
+  /** 机器人：阴影 → 轮子 → 金属底盘 → 托盘/载货 → 方向三角 → 状态灯 */
+  drawRobots(c) {
+    for (const r of this.sim.robots) this.drawRobot(c, r);
+  }
+
+  drawRobot(c, r) {
+    const cs = this.cs;
+    const p = r.renderPos();
+    const cx = this.cx(p.x), cy = this.cy(p.y);
+    const R = cs * 0.36;   // 底盘半径
+
+    // 柔和阴影（方向固定向下）
+    c.fillStyle = 'rgba(0,0,0,0.35)';
+    c.beginPath();
+    c.ellipse(cx + 1.5, cy + R * 0.55, R * 0.95, R * 0.55, 0, 0, Math.PI * 2);
+    c.fill();
+
+    c.save();
+    c.translate(cx, cy);
+    c.rotate(r.angle);
+
+    // 四轮（长边沿行进方向）
+    const wheelW = R * 0.52, wheelH = R * 0.24;
+    c.fillStyle = '#1B2534';
+    c.strokeStyle = 'rgba(0,0,0,0.5)';
+    c.lineWidth = 1;
+    for (const [wx, wy] of [[R * 0.52, -R * 0.72], [R * 0.52, R * 0.72], [-R * 0.52, -R * 0.72], [-R * 0.52, R * 0.72]]) {
+      rr(c, wx - wheelW / 2, wy - wheelH / 2, wheelW, wheelH, wheelH / 2);
+      c.fill();
+      c.stroke();
+    }
+
+    // 金属渐变底盘
+    const g = c.createRadialGradient(-R * 0.35, -R * 0.35, R * 0.1, 0, 0, R);
+    g.addColorStop(0, shade(r.color, 0.5));
+    g.addColorStop(0.55, r.color);
+    g.addColorStop(1, shade(r.color, -0.38));
+    c.beginPath();
+    c.arc(0, 0, R, 0, Math.PI * 2);
+    c.fillStyle = g;
+    c.fill();
+    c.strokeStyle = 'rgba(255,255,255,0.28)';
+    c.lineWidth = 1.2;
+    c.stroke();
+    c.strokeStyle = 'rgba(0,0,0,0.35)';
+    c.beginPath();
+    c.arc(0, 0, R + 0.8, 0, Math.PI * 2);
+    c.lineWidth = 1;
+    c.stroke();
+
+    // 方向指示三角（机头）
+    c.fillStyle = 'rgba(255,255,255,0.85)';
+    c.beginPath();
+    c.moveTo(R * 0.72, 0);
+    c.lineTo(R * 0.34, -R * 0.26);
+    c.lineTo(R * 0.34, R * 0.26);
+    c.closePath();
+    c.fill();
+
+    // 托盘（载货时托盘上叠货物色小箱）
+    if (r.cargo && r.state === RS.CARRYING) {
+      const ps = R * 0.78;
+      rr(c, -ps / 2, -ps / 2, ps, ps, 3);
+      c.fillStyle = '#3B4A5F';
+      c.fill();
+      c.strokeStyle = 'rgba(0,0,0,0.4)';
+      c.lineWidth = 1;
+      c.stroke();
+      const bs = ps * 0.72;
+      rr(c, -bs / 2, -bs / 2, bs, bs, 2.5);
+      c.fillStyle = r.cargo.color;
+      c.fill();
+      c.strokeStyle = 'rgba(255,255,255,0.3)';
+      c.stroke();
+      c.strokeStyle = 'rgba(15,23,42,0.5)';
+      c.lineWidth = Math.max(1.5, bs * 0.16);
+      c.beginPath();
+      c.moveTo(0, -bs / 2 + 1); c.lineTo(0, bs / 2 - 1);
+      c.moveTo(-bs / 2 + 1, 0); c.lineTo(bs / 2 - 1, 0);
+      c.stroke();
+    } else {
+      // 空托盘描边
+      const ps = R * 0.78;
+      rr(c, -ps / 2, -ps / 2, ps, ps, 3);
+      c.strokeStyle = 'rgba(255,255,255,0.22)';
+      c.lineWidth = 1.2;
+      c.stroke();
+    }
+    c.restore();
+
+    // 状态灯（不随角度旋转，位于中心）：空闲绿 / 移动蓝 / 等待黄 / 载货橙
+    const lamp = r.state === RS.IDLE ? '#4ADE80'
+      : r.state === RS.WAITING ? '#FACC15'
+      : r.state === RS.CARRYING ? '#FB923C'
+      : '#38BDF8';
+    c.save();
+    c.shadowColor = lamp;
+    c.shadowBlur = 7;
+    c.fillStyle = lamp;
+    c.beginPath();
+    c.arc(cx, cy, R * 0.16, 0, Math.PI * 2);
+    c.fill();
+    c.restore();
+
+    // 天线环
+    c.strokeStyle = 'rgba(255,255,255,0.35)';
+    c.lineWidth = 1.2;
+    c.beginPath();
+    c.arc(cx, cy, R * 0.34, 0, Math.PI * 2);
+    c.stroke();
   }
 }
 
 /* ---------------- 启动 ---------------- */
 (function boot() {
   const grid = new Grid();
+  const sim = new Simulation(grid);
   const canvas = document.getElementById('cv');
-  const renderer = new Renderer(canvas, grid);
+  const renderer = new Renderer(canvas, grid, sim);
+
+  window.__sim = sim;           // 调试 / 自测钩子
+  window.__renderer = renderer;
 
   const onResize = () => renderer.resize();
   window.addEventListener('resize', onResize);
@@ -553,11 +1057,45 @@ class Renderer {
   }
   renderer.resize();
 
-  // 渲染循环：逻辑（v0.2 起）与渲染分离，此处仅渲染
+  /* ----- HUD 低频刷新（4 次/秒） ----- */
+  const $ = (id) => document.getElementById(id);
+  const elRobots = $('statRobots'), elDelivered = $('statDelivered'),
+        elCargo = $('statCargo'), elTime = $('statTime'), elBadge = $('runStatus');
+
+  function fmtTime(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+  }
+
+  function updateHud() {
+    elRobots.textContent = String(sim.robots.length);
+    elDelivered.textContent = String(sim.delivered);
+    elCargo.textContent = String(sim.remainingCargo);
+    elTime.textContent = fmtTime(sim.elapsed);
+    if (sim.allDelivered) {
+      elBadge.className = 'badge done';
+      elBadge.innerHTML = '<i class="pulse-dot"></i>任务完成';
+    } else {
+      elBadge.className = 'badge';
+      elBadge.innerHTML = '<i class="pulse-dot"></i>运行中';
+    }
+  }
+  updateHud();
+
+  /* ----- 主循环：逻辑与渲染分离 ----- */
+  let last = performance.now();
+  let hudTimer = 0;
   function frame(t) {
-    // 跨屏拖动等场景 DPR 变化时重建
+    const dt = Math.min(50, t - last);   // 切后台回来时限制单帧步长
+    last = t;
+
     if ((window.devicePixelRatio || 1) !== renderer.dpr) renderer.resize();
+    sim.update(dt);
     renderer.render(t);
+
+    hudTimer += dt;
+    if (hudTimer >= 250) { hudTimer = 0; updateHud(); }
+
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
