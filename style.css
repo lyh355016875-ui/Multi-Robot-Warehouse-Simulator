@@ -248,6 +248,13 @@ body::before {
   font-variant-numeric: tabular-nums;
   font-weight: 650;
   font-size: 15px;
+  display: inline-block;
+}
+.stat-value.bump {
+  animation: bump 0.45s cubic-bezier(0.2, 1.6, 0.4, 1);
+}
+@keyframes bump {
+  40% { transform: scale(1.32); }
 }
 .divider { height: 1px; background: var(--stroke); margin: 9px 0; }
 

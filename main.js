@@ -285,8 +285,53 @@ class Cargo {
     this.x = x; this.y = y;
     this.color = color;
     this.assignedTo = null;   // 已分配的机器人 id（null = 未分配）
-    this.collected = false;   // 已被取走（地面消失，随机器人移动）
+    this.collected = false;   // 已被取走（货架消失，随机器人移动）
     this.delivered = false;   // 已送达
+  }
+}
+
+/* ---------------- 视觉特效：粒子 + 波纹（粒子总量上限 200） ---------------- */
+class Effects {
+  constructor() {
+    this.parts = [];    // {x,y,vx,vy,life,maxLife,color,size}（格坐标，速度格/秒）
+    this.ripples = [];  // {x,y,life,maxLife,color,maxR}
+  }
+
+  /** 迸发粒子（事件效果：取货 / 送达 / 障碍） */
+  spawnBurst(x, y, color, n, speed = 2.4) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const v = speed * (0.4 + Math.random() * 0.6);
+      this.parts.push({
+        x, y,
+        vx: Math.cos(a) * v, vy: Math.sin(a) * v,
+        life: 0, maxLife: 380 + Math.random() * 420,
+        color, size: 1.6 + Math.random() * 1.8,
+      });
+    }
+    // 总量硬上限 200（丢弃最旧的）
+    if (this.parts.length > 200) this.parts.splice(0, this.parts.length - 200);
+  }
+
+  /** 扩散波纹（送达 / 取货） */
+  spawnRipple(x, y, color, maxR = 1.3) {
+    this.ripples.push({ x, y, life: 0, maxLife: 560, color, maxR });
+  }
+
+  update(dt) {
+    const s = dt / 1000;
+    for (let i = this.parts.length - 1; i >= 0; i--) {
+      const p = this.parts[i];
+      p.life += dt;
+      if (p.life >= p.maxLife) { this.parts.splice(i, 1); continue; }
+      p.x += p.vx * s; p.y += p.vy * s;
+      p.vx *= (1 - 2.4 * s); p.vy *= (1 - 2.4 * s);   // 摩擦减速
+    }
+    for (let i = this.ripples.length - 1; i >= 0; i--) {
+      const r = this.ripples[i];
+      r.life += dt;
+      if (r.life >= r.maxLife) this.ripples.splice(i, 1);
+    }
   }
 }
 
@@ -319,6 +364,7 @@ class Robot {
     this.replanCooldown = 0;           // 规划失败冷却（防止高频重试 A*）
     this.needReplan = false;           // 障碍阻断路径，待本步完成后重规划
     this.replanFlashUntil = 0;         // REPLANNING 闪烁提示截止时刻（仿真毫秒）
+    this.pickupAt = -1;                // 最近取货时刻（托盘弹入动画用）
   }
 
   /** 渲染插值位置（浮点格坐标） */
@@ -466,6 +512,9 @@ class Robot {
       const c = this.cargo;
       if (c && !c.collected && sim.isAdjacent(this.gx, this.gy, c)) {
         c.collected = true;                          // 货物从货架消失
+        this.pickupAt = sim.elapsed;                 // 托盘货物弹入动画起点
+        sim.effects.spawnBurst(c.x, c.y, c.color, 13);
+        sim.effects.spawnRipple(c.x, c.y, c.color, 0.9);
         this.taskState = this.state = RS.CARRYING;
       }
       if (this.taskState === RS.CARRYING) this.planDrop(sim);
@@ -476,6 +525,10 @@ class Robot {
         if (c) c.delivered = true;
         this.cargo = null;
         sim.delivered++;
+        sim.effects.spawnBurst(this.gx, this.gy, '#4ADE80', 12);
+        sim.effects.spawnBurst(this.gx, this.gy, '#E2E8F0', 7, 1.5);
+        sim.effects.spawnRipple(this.gx, this.gy, '#22C55E', 1.5);
+        sim.effects.spawnRipple(this.gx, this.gy, '#4ADE80', 1.0);
         this.taskState = this.state = RS.IDLE;
         this.onIdle(sim);                            // 立即尝试接下一单
       } else {
@@ -553,6 +606,7 @@ class Simulation {
     this.paused = false;      // 暂停标志（暂停时可编辑障碍，时间冻结）
     this.collisions = 0;      // 碰撞守卫计数（必须恒为 0）
     this.rng = mulberry32(7); // 随机源（重置时换种子）
+    this.effects = new Effects();   // 粒子 / 波纹（跟随仿真时间，暂停时冻结）
 
     // 三个机器人，主站停车位出发
     this.addRobot(2, 13);
@@ -656,6 +710,7 @@ class Simulation {
     this.grid.cells[y][x] = CELL.OBST;
     // born 用真实时间：暂停时弹入动画照常播完（仿真时间冻结）
     this.grid.obstacles.set(`${x},${y}`, { x, y, born: performance.now() });
+    this.effects.spawnBurst(x, y, '#FB923C', 9, 1.6);
     this.onObstaclesChanged();
     return true;
   }
@@ -664,6 +719,7 @@ class Simulation {
     if (this.grid.at(x, y) !== CELL.OBST) return false;
     this.grid.cells[y][x] = CELL.FLOOR;
     this.grid.obstacles.delete(`${x},${y}`);
+    this.effects.spawnBurst(x, y, '#94A3B8', 6, 1.2);
     this.onObstaclesChanged();
     return true;
   }
@@ -822,6 +878,7 @@ class Simulation {
     for (const r of this.robots) r.updateMove(dt, this);
     for (const r of this.robots) r.updateDecision(dt, this);
     for (const r of this.robots) r.updateTurn(dt);
+    this.effects.update(dt);
     this.checkCollisions();
   }
 
@@ -1231,10 +1288,11 @@ class Renderer {
     c.clearRect(0, 0, this.cssW, this.cssH);
     c.drawImage(this.staticLayer, 0, 0, this.cssW, this.cssH);
     this.drawAmbientFx(c, t);
-    this.drawObstacles(c);
+    this.drawObstacles(c, t);
     this.drawPaths(c, t);
-    this.drawCargos(c);
-    this.drawRobots(c);
+    this.drawCargos(c, t);
+    this.drawRobots(c, t);
+    this.drawEffects(c);
     this.drawHover(c);
   }
 
@@ -1263,13 +1321,21 @@ class Renderer {
     zoneRing(CFG.HOME, 4 + 3 * p2, 'rgba(59,130,246,0.9)', 0.07 + 0.11 * p2, 14);
   }
 
-  /** 障碍物：俯视警示桶（橙白扇形条纹），260ms 弹入动画 */
-  drawObstacles(c) {
+  /** 障碍物：俯视警示桶（橙白扇形条纹），260ms 弹入 + 缓慢脉冲光圈 */
+  drawObstacles(c, t) {
     for (const ob of this.grid.obstacles.values()) {
       const cx = this.cx(ob.x), cy = this.cy(ob.y);
       const cs = this.cs;
       const age = performance.now() - ob.born;
       const k = age >= 260 ? 1 : Math.max(0.01, easeOutBack(clamp(age / 260, 0, 1)));
+
+      // 脉冲光圈（相位按格位错开，避免同频闪烁）
+      const pulse = 0.5 + 0.5 * Math.sin(t / 850 + (ob.x + ob.y) * 0.9);
+      c.strokeStyle = withA('#F97316', 0.09 + 0.17 * pulse);
+      c.lineWidth = 1.5;
+      c.beginPath();
+      c.arc(cx, cy, cs * (0.46 + 0.06 * pulse), 0, Math.PI * 2);
+      c.stroke();
 
       c.save();
       c.translate(cx, cy);
@@ -1372,8 +1438,8 @@ class Renderer {
     }
   }
 
-  /** 货架上的货物：带包装带的小箱子（绘制位置向货架厚度中心微收） */
-  drawCargos(c) {
+  /** 货架上的货物：带包装带的小箱子（向货架厚度中心微收），待取呼吸环 */
+  drawCargos(c, t) {
     for (const cargo of this.sim.cargos) {
       if (cargo.collected || cargo.delivered) continue;
       const cs = this.cs;
@@ -1388,11 +1454,12 @@ class Renderer {
       }
       const s = cs * 0.44;
 
-      // 外圈提示环
-      c.strokeStyle = withA(cargo.color, 0.28);
+      // 待取呼吸环
+      const pulse = 0.5 + 0.5 * Math.sin(t / 650 + cargo.id * 1.3);
+      c.strokeStyle = withA(cargo.color, 0.16 + 0.22 * pulse);
       c.lineWidth = 1.5;
       c.beginPath();
-      c.arc(cx, cy, s * 0.82, 0, Math.PI * 2);
+      c.arc(cx, cy, s * (0.82 + 0.09 * pulse), 0, Math.PI * 2);
       c.stroke();
 
       // 阴影
@@ -1432,11 +1499,11 @@ class Renderer {
   }
 
   /** 机器人：阴影 → 轮子 → 金属底盘 → 托盘/载货 → 方向三角 → 状态灯 */
-  drawRobots(c) {
-    for (const r of this.sim.robots) this.drawRobot(c, r);
+  drawRobots(c, t) {
+    for (const r of this.sim.robots) this.drawRobot(c, r, t);
   }
 
-  drawRobot(c, r) {
+  drawRobot(c, r, t) {
     const cs = this.cs;
     const p = r.renderPos();
     const cx = this.cx(p.x), cy = this.cy(p.y);
@@ -1490,7 +1557,7 @@ class Renderer {
     c.closePath();
     c.fill();
 
-    // 托盘（载货时托盘上叠货物色小箱）
+    // 托盘（载货时托盘上叠货物色小箱，取货后 220ms 回弹弹入）
     if (r.cargo && r.state === RS.CARRYING) {
       const ps = R * 0.78;
       rr(c, -ps / 2, -ps / 2, ps, ps, 3);
@@ -1499,6 +1566,14 @@ class Renderer {
       c.strokeStyle = 'rgba(0,0,0,0.4)';
       c.lineWidth = 1;
       c.stroke();
+
+      let boxK = 1;
+      if (r.pickupAt >= 0) {
+        const pt = (this.sim.elapsed - r.pickupAt) / 220;
+        boxK = pt >= 1 ? 1 : Math.max(0.01, easeOutBack(clamp(pt, 0, 1)));
+      }
+      c.save();
+      c.scale(boxK, boxK);
       const bs = ps * 0.72;
       rr(c, -bs / 2, -bs / 2, bs, bs, 2.5);
       c.fillStyle = r.cargo.color;
@@ -1511,6 +1586,7 @@ class Renderer {
       c.moveTo(0, -bs / 2 + 1); c.lineTo(0, bs / 2 - 1);
       c.moveTo(-bs / 2 + 1, 0); c.lineTo(bs / 2 - 1, 0);
       c.stroke();
+      c.restore();
     } else {
       // 空托盘描边
       const ps = R * 0.78;
@@ -1527,12 +1603,13 @@ class Renderer {
       : r.state === RS.REPLANNING ? '#22D3EE'
       : r.state === RS.CARRYING ? '#FB923C'
       : '#38BDF8';
+    const breathe = 0.5 + 0.5 * Math.sin(t / 450 + r.id * 1.9);
     c.save();
     c.shadowColor = lamp;
-    c.shadowBlur = 7;
+    c.shadowBlur = 6 + 4 * breathe;
     c.fillStyle = lamp;
     c.beginPath();
-    c.arc(cx, cy, R * 0.16, 0, Math.PI * 2);
+    c.arc(cx, cy, R * 0.16 * (1 + 0.18 * breathe), 0, Math.PI * 2);
     c.fill();
     c.restore();
 
@@ -1542,6 +1619,31 @@ class Renderer {
     c.beginPath();
     c.arc(cx, cy, R * 0.34, 0, Math.PI * 2);
     c.stroke();
+  }
+
+  /** 粒子与波纹（事件特效，跟随仿真时间） */
+  drawEffects(c) {
+    const fx = this.sim.effects;
+    // 波纹：从事件点扩散的圆环
+    for (const rp of fx.ripples) {
+      const t = rp.life / rp.maxLife;
+      const ease = 1 - (1 - t) * (1 - t);
+      c.strokeStyle = withA(rp.color, 0.45 * (1 - t));
+      c.lineWidth = 2;
+      c.beginPath();
+      c.arc(this.cx(rp.x), this.cy(rp.y), (0.2 + rp.maxR * ease) * this.cs, 0, Math.PI * 2);
+      c.stroke();
+    }
+    // 粒子：小圆点，随寿命淡出收缩
+    for (const p of fx.parts) {
+      const t = p.life / p.maxLife;
+      c.globalAlpha = 1 - t;
+      c.fillStyle = p.color;
+      c.beginPath();
+      c.arc(this.cx(p.x), this.cy(p.y), Math.max(0.4, p.size * (1 - t * 0.55)), 0, Math.PI * 2);
+      c.fill();
+    }
+    c.globalAlpha = 1;
   }
 }
 
@@ -1562,6 +1664,7 @@ class UI {
     };
     this.bind();
     this.updateHud();
+    this.prev = { robots: -1, delivered: -1 };   // HUD 弹跳动画：记录前值
   }
 
   bind() {
@@ -1650,11 +1753,22 @@ class UI {
     return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   }
 
+  /** 数值变化时触发弹跳动画（重排重触发） */
+  bumpIfChanged(key, value, el) {
+    el.textContent = String(value);
+    if (this.prev && this.prev[key] !== value && this.prev[key] >= 0) {
+      el.classList.remove('bump');
+      void el.offsetWidth;
+      el.classList.add('bump');
+    }
+    if (this.prev) this.prev[key] = value;
+  }
+
   /** HUD + 徽章 + 按钮态 + 任务完成浮层（低频调用） */
   updateHud() {
     const sim = this.sim;
-    this.el.robots.textContent = String(sim.robots.length);
-    this.el.delivered.textContent = String(sim.delivered);
+    this.bumpIfChanged('robots', sim.robots.length, this.el.robots);
+    this.bumpIfChanged('delivered', sim.delivered, this.el.delivered);
     this.el.cargo.textContent = String(sim.remainingCargo);
     this.el.time.textContent = this.fmtTime(sim.elapsed);
 
