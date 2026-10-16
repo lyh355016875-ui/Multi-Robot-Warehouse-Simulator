@@ -32,12 +32,11 @@ const CFG = {
     { row: 'C', x0: 8, y0: 13, x1: 19, y1: 14 },
   ],
 
-  // v0.2 固定货物出生点（货架旁可通行格）
+  // v0.3 固定货物出生点（货架格：货物摆在货架上，机器人到相邻通道格取货）
   CARGO_SPOTS: [
-    [10, 2], [16, 2],    // A 排上方通道
-    [8, 6], [14, 6],     // A/B 之间通道
-    [10, 11], [17, 11],  // B/C 之间通道
-    [8, 15], [15, 15],   // C 排下方通道
+    [8, 3], [14, 4], [18, 3],   // A 排
+    [10, 8], [16, 9],           // B 排
+    [8, 13], [12, 14], [16, 13],// C 排
   ],
 
   // 货物包装色板（中饱和、彼此和谐）
@@ -306,13 +305,16 @@ class Robot {
     this.toX = gx; this.toY = gy;      // 当前移动步终点
     this.moving = false;
     this.moveT = 0;                    // 当前步进度 0..1
+    this.leftover = 0;                 // 跨步剩余时间（保持速度连续）
     this.angle = -Math.PI / 2;         // 初始朝上
     this.targetAngle = this.angle;
-    this.state = RS.IDLE;
+    this.state = RS.IDLE;              // 展示状态（含 waiting）
+    this.taskState = RS.IDLE;          // 实际任务状态（waiting 恢复的目标）
     this.path = [];                    // 剩余路径 [{x,y}, ...]
     this.cargo = null;                 // 已接单 / 载运的货物
     this.color = CFG.ROBOT_COLORS[id % CFG.ROBOT_COLORS.length];
-    this.blocked = 0;                  // 连续受阻计数（v0.3 死锁解除用）
+    this.blockedMs = 0;                // 连续受阻时长（仿真毫秒，死锁解除用）
+    this.replanCooldown = 0;           // 规划失败冷却（防止高频重试 A*）
   }
 
   /** 渲染插值位置（浮点格坐标） */
@@ -338,68 +340,144 @@ class Robot {
     this.path.shift();
   }
 
-  /** 每帧逻辑：推进移动、状态转换、平滑转向 */
-  update(dt, sim) {
-    if (!this.moving && this.path.length > 0) this.beginStep();
+  /** 逻辑格占用：移动中占 from + to 两格（物理上处于两格之间） */
+  occupiedCells() {
+    return this.moving
+      ? [[this.gx, this.gy], [this.toX, this.toY]]
+      : [[this.gx, this.gy]];
+  }
 
-    if (this.moving) {
-      this.moveT += (dt * sim.speedMult) / CFG.MOVE_MS;
-      if (this.moveT >= 1) {
-        const leftover = this.moveT - 1;
-        this.finishStep();
-        if (this.path.length === 0) this.onArrive(sim);
-        if (this.path.length > 0) {
-          this.beginStep();
-          this.moveT = leftover;
-        } else {
-          this.moving = false;
-          this.moveT = 0;
-        }
-      }
-    } else if (this.state === RS.IDLE) {
-      this.onIdle(sim);
-    }
+  /* ---- 每帧三段式：移动 → 决策 → 转向 ----
+   * 决策轮由 Simulation 统一按 id 顺序调度，等同"定点迭代解析器"：
+   * 前序机器人完成一步后释放的格子，同帧内后序机器人立即可用。 */
 
-    // 平滑转向
-    const da = wrapAngle(this.targetAngle - this.angle);
-    if (Math.abs(da) < 0.02) {
-      this.angle = this.targetAngle;
-    } else {
-      this.angle = wrapAngle(this.angle + da * Math.min(1, dt / CFG.TURN_MS));
+  updateMove(dt, sim) {
+    if (!this.moving) return;
+    this.moveT += (dt * sim.speedMult) / CFG.MOVE_MS;
+    if (this.moveT >= 1) {
+      this.leftover = this.moveT - 1;
+      this.finishStep();
+      this.moving = false;
     }
   }
 
-  /** 空闲：认领最近未分配货物并规划取货路径 */
+  updateDecision(dt, sim) {
+    if (this.replanCooldown > 0) this.replanCooldown -= dt;
+    if (this.moving) { this.blockedMs = 0; return; }
+
+    if (this.path.length === 0) this.onArrive(sim);
+    if (this.path.length === 0) return;
+
+    const next = this.path[0];
+    const occ = sim.occupiedBy(next.x, next.y, this);
+    if (!occ) {
+      // 格子空闲：进入（消耗上一格的溢出时间，速度连续）
+      this.beginStep();
+      this.moveT = this.leftover;
+      this.leftover = 0;
+      if (this.state === RS.WAITING) this.state = this.taskState;
+      this.blockedMs = 0;
+      return;
+    }
+
+    // 目标格被占：等待
+    if (this.taskState !== RS.IDLE) this.state = RS.WAITING;
+    this.blockedMs += dt * sim.speedMult;
+
+    // 头对头死锁：对方静止、且想来我的当前格 → 低 id 优先，我立即让位
+    // （对方 id 更大时，它自己的决策轮会检测并让位，我保持等待即可）
+    if (!occ.moving && occ.path[0] &&
+        occ.path[0].x === this.gx && occ.path[0].y === this.gy &&
+        occ.id < this.id) {
+      sim.yieldRobot(this);
+      return;
+    }
+    // 错峰超时让位：阈值按 id 错开，避免所有机器人同时让位造成二次拥堵
+    if (this.blockedMs >= (6 + this.id % 4) * CFG.MOVE_MS) sim.yieldRobot(this);
+  }
+
+  updateTurn(dt) {
+    const da = wrapAngle(this.targetAngle - this.angle);
+    if (Math.abs(da) < 0.02) this.angle = this.targetAngle;
+    else this.angle = wrapAngle(this.angle + da * Math.min(1, dt / CFG.TURN_MS));
+  }
+
+  /* ---- 任务逻辑 ---- */
+
+  /** 空闲：认领最近未分配货物（按拣货位距离），规划到拣货位 */
   onIdle(sim) {
-    let best = null, bd = Infinity;
+    if (this.replanCooldown > 0) return;
+    let best = null, bCell = null, bd = Infinity;
     for (const c of sim.cargos) {
       if (c.assignedTo !== null || c.collected) continue;
-      const d = Math.abs(c.x - this.gx) + Math.abs(c.y - this.gy);
-      if (d < bd) { bd = d; best = c; }
+      const cell = sim.bestPickupCell(c, this.gx, this.gy, this);
+      if (!cell) continue;
+      const d = Math.abs(cell.x - this.gx) + Math.abs(cell.y - this.gy);
+      if (d < bd) { bd = d; best = c; bCell = cell; }
     }
     if (!best) return;
-    const path = sim.planner.findPath({ x: this.gx, y: this.gy }, { x: best.x, y: best.y });
-    if (!path) return;
+    const p = sim.planner.findPath({ x: this.gx, y: this.gy }, bCell, sim.blockedFor(this));
+    if (!p) { this.replanCooldown = 300; return; }
     best.assignedTo = this.id;
     this.cargo = best;
-    this.state = RS.TO_PICKUP;
-    this.path = path;
+    this.taskState = this.state = RS.TO_PICKUP;
+    this.path = p;
   }
 
-  /** 到达路径终点：取货 / 交付 */
+  /** 到达终点 / 路径耗尽的统一入口（也承担规划失败后的重试） */
   onArrive(sim) {
-    if (this.state === RS.TO_PICKUP && this.cargo) {
-      this.cargo.collected = true;
-      this.state = RS.CARRYING;
-      const goal = sim.nearestDropCell(this.gx, this.gy);
-      this.path = goal ? (sim.planner.findPath({ x: this.gx, y: this.gy }, goal) || []) : [];
-    } else if (this.state === RS.CARRYING) {
+    if (this.taskState === RS.TO_PICKUP) {
       const c = this.cargo;
-      this.cargo = null;
-      this.state = RS.IDLE;
-      if (c) c.delivered = true;
-      sim.delivered++;
+      if (c && !c.collected && sim.isAdjacent(this.gx, this.gy, c)) {
+        c.collected = true;                          // 货物从货架消失
+        this.taskState = this.state = RS.CARRYING;
+      }
+      if (this.taskState === RS.CARRYING) this.planDrop(sim);
+      else this.planPickup(sim);
+    } else if (this.taskState === RS.CARRYING) {
+      if (sim.inDrop(this.gx, this.gy)) {
+        const c = this.cargo;
+        if (c) c.delivered = true;
+        this.cargo = null;
+        sim.delivered++;
+        this.taskState = this.state = RS.IDLE;
+        this.onIdle(sim);                            // 立即尝试接下一单
+      } else {
+        this.planDrop(sim);
+      }
+    } else {
+      this.onIdle(sim);
     }
+  }
+
+  planPickup(sim) {
+    if (this.replanCooldown > 0) return;
+    const c = this.cargo;
+    if (!c || c.collected) { this.abandonTask(); return; }
+    const cell = sim.bestPickupCell(c, this.gx, this.gy, this);
+    if (!cell || (cell.x === this.gx && cell.y === this.gy)) {
+      this.replanCooldown = 300;
+      return;
+    }
+    const p = sim.planner.findPath({ x: this.gx, y: this.gy }, cell, sim.blockedFor(this));
+    if (p && p.length) this.path = p;
+    else this.replanCooldown = 300;
+  }
+
+  planDrop(sim) {
+    if (this.replanCooldown > 0) return;
+    const goal = sim.nearestDropCell(this.gx, this.gy, this);
+    if (!goal) { this.replanCooldown = 300; return; }
+    const p = sim.planner.findPath({ x: this.gx, y: this.gy }, goal, sim.blockedFor(this));
+    if (p) this.path = p;
+    else this.replanCooldown = 300;
+  }
+
+  abandonTask() {
+    if (this.cargo) { this.cargo.assignedTo = null; this.cargo = null; }
+    this.taskState = this.state = RS.IDLE;
+    this.path = [];
+    this.replanCooldown = 200;
   }
 }
 
@@ -411,14 +489,21 @@ class Simulation {
     this.robots = [];
     this.cargos = [];
     this.delivered = 0;
-    this.elapsed = 0;        // 累计运行毫秒（不含暂停，暂停 v0.5）
-    this.speedMult = 1;      // 速度倍率（v0.5 接滑块）
+    this.elapsed = 0;         // 累计运行毫秒
+    this.speedMult = 1;       // 速度倍率（v0.5 接滑块）
+    this.collisions = 0;      // 碰撞守卫计数（必须恒为 0）
+    this.rng = mulberry32(7); // 让位方向等随机性（确定性种子）
 
-    this.addRobot(2, 13);    // v0.2：单机器人，主站停车位
+    // v0.3：三个机器人，主站停车位出发
+    this.addRobot(2, 13);
+    this.addRobot(3, 13);
+    this.addRobot(4, 13);
+    this.spawnCargos(CFG.CARGO_SPOTS);
+  }
 
-    CFG.CARGO_SPOTS.forEach(([x, y], i) => {
-      this.cargos.push(new Cargo(i + 1, x, y, CFG.CARGO_COLORS[i % CFG.CARGO_COLORS.length]));
-    });
+  spawnCargos(spots) {
+    this.cargos = spots.map(([x, y], i) =>
+      new Cargo(i + 1, x, y, CFG.CARGO_COLORS[i % CFG.CARGO_COLORS.length]));
   }
 
   addRobot(x, y) {
@@ -427,13 +512,62 @@ class Simulation {
     return r;
   }
 
-  /** 距离 (x,y) 最近的卸货格（v0.3 起还会排除占用格） */
-  nearestDropCell(x, y) {
+  /* ---- 占用与通行 ---- */
+
+  /** (x,y) 被哪个机器人占用（移动中占 from+to 两格），except 除外 */
+  occupiedBy(x, y, except) {
+    for (const r of this.robots) {
+      if (r === except) continue;
+      if (r.moving) {
+        if ((r.gx === x && r.gy === y) || (r.toX === x && r.toY === y)) return r;
+      } else if (r.gx === x && r.gy === y) return r;
+    }
+    return null;
+  }
+
+  /** 其他机器人的占用格集合（A* 规划时视为墙） */
+  blockedFor(robot) {
+    const s = new Set();
+    for (const o of this.robots) {
+      if (o === robot) continue;
+      s.add(`${o.gx},${o.gy}`);
+      if (o.moving) s.add(`${o.toX},${o.toY}`);
+    }
+    return s;
+  }
+
+  /** (x,y) 是否与货物相邻（拣货判定） */
+  isAdjacent(x, y, cargo) {
+    return Math.abs(x - cargo.x) + Math.abs(y - cargo.y) === 1;
+  }
+
+  /** (x,y) 是否在卸货区内 */
+  inDrop(x, y) {
+    const z = CFG.DROP;
+    return x >= z.x0 && x <= z.x1 && y >= z.y0 && y <= z.y1;
+  }
+
+  /** 货物的最佳拣货位：相邻可通行格中未被占用、离 (fx,fy) 最近者 */
+  bestPickupCell(cargo, fx, fy, robot) {
+    let best = null, bd = Infinity;
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const x = cargo.x + dx, y = cargo.y + dy;
+      if (!this.grid.walkable(x, y)) continue;
+      if (robot && this.occupiedBy(x, y, robot)) continue;
+      const d = Math.abs(x - fx) + Math.abs(y - fy);
+      if (d < bd) { bd = d; best = { x, y }; }
+    }
+    return best;
+  }
+
+  /** 距离 (x,y) 最近的空闲卸货格 */
+  nearestDropCell(x, y, robot) {
     const z = CFG.DROP;
     let best = null, bd = Infinity;
     for (let cy = z.y0; cy <= z.y1; cy++) {
       for (let cx = z.x0; cx <= z.x1; cx++) {
         if (!this.grid.walkable(cx, cy)) continue;
+        if (robot && this.occupiedBy(cx, cy, robot)) continue;
         const d = Math.abs(cx - x) + Math.abs(cy - y);
         if (d < bd) { bd = d; best = { x: cx, y: cy }; }
       }
@@ -441,9 +575,57 @@ class Simulation {
     return best;
   }
 
+  /** 机器人当前任务目标（让位后重新规划用） */
+  taskGoal(r) {
+    if (r.taskState === RS.TO_PICKUP && r.cargo) {
+      return this.bestPickupCell(r.cargo, r.gx, r.gy, r);
+    }
+    if (r.taskState === RS.CARRYING) return this.nearestDropCell(r.gx, r.gy, r);
+    return null;
+  }
+
+  /** 死锁解除：侧移到随机空闲邻格，并重新规划回任务目标 */
+  yieldRobot(r) {
+    if (r.moving) return;
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const start = Math.floor(this.rng() * 4);   // 随机起点，避免集体同向让位
+    for (let i = 0; i < 4; i++) {
+      const [dx, dy] = dirs[(start + i) % 4];
+      const x = r.gx + dx, y = r.gy + dy;
+      if (!this.grid.walkable(x, y)) continue;
+      if (this.occupiedBy(x, y, r)) continue;
+      const goal = this.taskGoal(r);
+      const rest = goal ? this.planner.findPath({ x, y }, goal, this.blockedFor(r)) : null;
+      r.path = rest ? [{ x, y }, ...rest] : [{ x, y }];
+      r.blockedMs = 0;
+      return;
+    }
+    r.blockedMs = -CFG.MOVE_MS * 2;   // 无处可让，延后重试
+  }
+
+  /** 碰撞守卫：逻辑格互斥，出现重叠立即报错（必须恒为 0） */
+  checkCollisions() {
+    const seen = new Map();
+    for (const r of this.robots) {
+      for (const [x, y] of r.occupiedCells()) {
+        const k = x + ',' + y;
+        if (seen.has(k)) {
+          this.collisions++;
+          console.error(`[碰撞守卫] 机器人 #${seen.get(k)} 与 #${r.id} 重叠于 (${x},${y})`);
+        } else {
+          seen.set(k, r.id);
+        }
+      }
+    }
+  }
+
   update(dt) {
     this.elapsed += dt;
-    for (const r of this.robots) r.update(dt, this);
+    // 三段式调度：决策轮按 id 顺序，前序机器人释放的格子同帧可用（链式前进）
+    for (const r of this.robots) r.updateMove(dt, this);
+    for (const r of this.robots) r.updateDecision(dt, this);
+    for (const r of this.robots) r.updateTurn(dt);
+    this.checkCollisions();
   }
 
   get allDelivered() {
@@ -876,13 +1058,21 @@ class Renderer {
     }
   }
 
-  /** 地面货物：带包装带的小箱子 */
+  /** 货架上的货物：带包装带的小箱子（绘制位置向货架厚度中心微收） */
   drawCargos(c) {
     for (const cargo of this.sim.cargos) {
       if (cargo.collected || cargo.delivered) continue;
       const cs = this.cs;
-      const cx = this.cx(cargo.x), cy = this.cy(cargo.y);
-      const s = cs * 0.46;
+      const cx = this.cx(cargo.x);
+      let cy = this.cy(cargo.y);
+      for (const sh of CFG.SHELVES) {
+        if (cargo.x >= sh.x0 && cargo.x <= sh.x1 && cargo.y >= sh.y0 && cargo.y <= sh.y1) {
+          const midY = (sh.y0 + sh.y1 + 1) / 2;
+          cy = this.cy(cargo.y + clamp(midY - cargo.y, -0.2, 0.2));
+          break;
+        }
+      }
+      const s = cs * 0.44;
 
       // 外圈提示环
       c.strokeStyle = withA(cargo.color, 0.28);

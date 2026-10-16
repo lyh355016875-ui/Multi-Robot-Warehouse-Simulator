@@ -31,7 +31,8 @@ CLAUDE.md    本文件
 - `Grid`：28×18 网格数据，格子类型 floor/shelf/home/drop/obstacle；可通行判定。
 - `PathPlanner`：A*（四方向、曼哈顿启发、**二叉堆**开放列表）；接受「临时占用格」
   参数；含节流。
-- `Cargo`：货物（id、格坐标、包装色、assignedTo）。
+- `Cargo`：货物（id、格坐标、包装色、assignedTo）。货物位于**货架格**上；
+  机器人移动到货物相邻的可通行通道格（拣货位，`Simulation.bestPickupCell`）取货。
 - `Robot`：状态机 idle/toPickup/carrying/waiting/replanning；格位置 + 渲染插值；
   平滑转向。
 - `Simulation`：每 tick 的调度核心。
